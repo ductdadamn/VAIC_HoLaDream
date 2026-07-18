@@ -301,7 +301,7 @@ with center:
             st.caption(f"💡 {p['fit_context']}")
             quota_txt = "ngay bây giờ" if p["open_quota_at"] == 0 else f"{p['open_quota_at']}h trước giờ khởi hành"
             st.caption(f"Mở lại quota: **{quota_txt}** · Last-call: **{p['last_call_hours']}h** trước giờ chạy")
-            if st.button("Chọn để xem giải thích", key=f"select_{pname}", width="stretch"):
+            if st.button("Chọn chính sách này", key=f"select_{pname}", width="stretch"):
                 st.session_state["selected_policy"] = pname
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
