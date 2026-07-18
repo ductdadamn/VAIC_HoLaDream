@@ -21,7 +21,7 @@ _FALLBACK_STATIONS = [
 
 _PRICE_PER_KM = 1500  # VND/km — ước lượng fare phẳng; find_gaps chỉ nhận seat_matrix
                       # theo contract nên không có giá vé thật để tra.
-_SEG_SEP = " → "
+SEG_SEP = " → "  # dùng chung để policy.py/simulate.py dựng/tách tên cột segment
 
 
 def _load_stations() -> pd.DataFrame:
@@ -89,7 +89,7 @@ def build_seat_matrix(tickets_df: pd.DataFrame, train, date) -> pd.DataFrame:
     booked = trip[trip["status"] == "booked"]
     seat_ids = sorted(trip["seat_id"].unique())
 
-    col_names = [f"{f}{_SEG_SEP}{t}" for f, t in segments]
+    col_names = [f"{f}{SEG_SEP}{t}" for f, t in segments]
     matrix = pd.DataFrame("EMPTY", index=seat_ids, columns=col_names)
 
     for _, row in booked.iterrows():
@@ -103,6 +103,35 @@ def build_seat_matrix(tickets_df: pd.DataFrame, train, date) -> pd.DataFrame:
     return matrix
 
 
+def segment_occupancy(seat_matrix: pd.DataFrame) -> dict:
+    """occupancy mỗi cột (segment) = tỉ lệ SOLD trong seat_matrix. CÙNG công thức
+    seats_sold/capacity của aggregate_segments — tính trực tiếp trên seat_matrix vì
+    generate_policies()/simulate() không nhận tickets_df/train/date theo contract
+    (hai ma trận cùng derive từ một tickets_df nên occupancy khớp nhau, không phải
+    một phép tính khác).
+    """
+    n = len(seat_matrix) or 1
+    return {col: float((seat_matrix[col] == "SOLD").sum()) / n for col in seat_matrix.columns}
+
+
+def segments_between(from_station: str, to_station: str) -> list:
+    """Danh sách tên cột (segment) trải giữa 2 ga, theo station order chung."""
+    stations = _load_stations()
+    segments = _segment_list(stations)
+    order = _order_map(stations)
+    lo, hi = order[from_station], order[to_station]
+    return [f"{f}{SEG_SEP}{t}" for f, t in segments if order[f] >= lo and order[t] <= hi]
+
+
+def route_fare(from_station: str, to_station: str) -> float:
+    """Ước lượng fare theo khoảng cách km_from_hanoi × giá/km cố định — dùng chung
+    cho find_gaps/policy/simulate vì các hàm đó không nhận giá vé thật theo contract.
+    """
+    stations = _load_stations()
+    km = dict(zip(stations["name"], stations["km_from_hanoi"]))
+    return abs(km[to_station] - km[from_station]) * _PRICE_PER_KM
+
+
 def find_gaps(seat_matrix: pd.DataFrame) -> pd.DataFrame:
     """→ [seat_id, gap_from, gap_to, matched_demand, extra_revenue].
     Quét từng hàng (ghế) tìm đoạn EMPTY liên tục kẹp giữa 2 đoạn SOLD.
@@ -113,9 +142,7 @@ def find_gaps(seat_matrix: pd.DataFrame) -> pd.DataFrame:
     extra_revenue ước lượng bằng khoảng cách (km_from_hanoi) × giá/km cố định.
     """
     columns = list(seat_matrix.columns)
-    segments = [tuple(col.split(_SEG_SEP)) for col in columns]
-    stations = _load_stations()
-    km = dict(zip(stations["name"], stations["km_from_hanoi"]))
+    segments = [tuple(col.split(SEG_SEP)) for col in columns]
 
     rows = []
     n = len(columns)
@@ -131,7 +158,7 @@ def find_gaps(seat_matrix: pd.DataFrame) -> pd.DataFrame:
                     gap_to = segments[j - 1][1]
                     gap_cols = columns[i:j]
                     matched_demand = int((seat_matrix[gap_cols] == "SOLD").all(axis=1).sum())
-                    extra_revenue = round(matched_demand * abs(km[gap_to] - km[gap_from]) * _PRICE_PER_KM, 0)
+                    extra_revenue = round(matched_demand * route_fare(gap_from, gap_to), 0)
                     rows.append({
                         "seat_id": seat_id,
                         "gap_from": gap_from,
