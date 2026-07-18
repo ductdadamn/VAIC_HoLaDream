@@ -11,7 +11,6 @@ last_call_hours/fit_context/safety_margin); gap_from/gap_to/origin/destination �
 là TÊN GA (không phải mã ga).
 """
 from __future__ import annotations
-import datetime as dt
 import re
 import pandas as pd
 import streamlit as st
@@ -22,6 +21,7 @@ from core import (
     find_gaps, generate_policies, apply_policy_overlay, simulate, run_baseline,
     rank_policies, explain,
 )
+from core.audit import log_decision
 from core.utils import fmt_vnd, fmt_pct
 
 OVERRIDE_REASONS = ["Thiên tai", "An sinh xã hội", "Lỗi hệ thống", "Nghi ngờ đầu cơ"]
@@ -352,11 +352,9 @@ if st.session_state["last_toast"]:
 btn_col1, btn_col2 = st.columns(2)
 with btn_col1:
     if st.button("✅ APPROVE — Duyệt chính sách", key="approve_btn", width="stretch"):
-        st.session_state["audit_log"].append({
-            "timestamp": dt.datetime.now().isoformat(sep=" ", timespec="seconds"),
-            "train": train, "date": depart_date, "policy": POLICY_LABEL_VI[selected_name],
-            "action": "APPROVE", "reason": "-",
-        })
+        st.session_state["audit_log"].append(
+            log_decision(train, depart_date, POLICY_LABEL_VI[selected_name], "APPROVE")
+        )
         msg = "Đã cập nhật chính sách vào hệ thống dsvn.vn thành công."
         st.session_state["last_toast"] = msg
         st.toast(msg, icon="✅")
@@ -377,11 +375,9 @@ def override_dialog():
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Xác nhận Override", type="primary", width="stretch", disabled=(reason is None)):
-            st.session_state["audit_log"].append({
-                "timestamp": dt.datetime.now().isoformat(sep=" ", timespec="seconds"),
-                "train": train, "date": depart_date, "policy": POLICY_LABEL_VI[selected_name],
-                "action": "OVERRIDE", "reason": reason,
-            })
+            st.session_state["audit_log"].append(
+                log_decision(train, depart_date, POLICY_LABEL_VI[selected_name], "OVERRIDE", reason)
+            )
             st.session_state["last_toast"] = f"Đã ghi nhận OVERRIDE — lý do: {reason}."
             st.session_state["show_override_dialog"] = False
             st.rerun()
