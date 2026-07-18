@@ -1,39 +1,84 @@
-# Vietnam Railway United — Decision Copilot (VAIC 2026)
+# Vietnam Railway United — Decision Copilot
 
-Decision Demo cho quản trị doanh thu đường sắt VN. Luồng: forecast cầu → sinh 3
-policy giữ/bán ghế (Conservative/Balanced/Aggressive) → Gap Engine ghép chặng
-trống → simulate (Monte Carlo) so với baseline → rank → explain → Manager
-Approve/Override.
+Decision Demo (không phải hệ thống thật) cho bài toán quản lý doanh thu đường sắt VN.
+Luồng: **Forecast → 3 policy giữ/bán ghế → Gap Engine ghép chặng → Simulate vs Baseline
+→ Ranking → Explain (kèm rủi ro + độ tin cậy) → Manager Approve/Override**.
 
-Không phải hệ thống thật — Streamlit monolith, các module gọi nhau bằng hàm
-Python trực tiếp (không FastAPI/REST/login/React).
+Stack: Python + Streamlit (monolith, không REST/login/React). Chạy trên
+Streamlit Community Cloud.
 
-## Chạy thử
+## Chạy local
 
 ```bash
-python -m venv venv
-source venv/bin/activate
 pip install -r requirements.txt
-python gen_data.py          # sinh data/tickets.csv, stations.csv, external_signals.csv
+python gen_data.py          # sinh lại data/ nếu cần (đã commit sẵn, không bắt buộc)
 streamlit run app.py
 ```
 
 ## Cấu trúc
 
 ```
-railmind/
-  app.py            Streamlit dashboard (Dev 3)
-  gen_data.py        sinh dữ liệu mẫu vào data/ (Dev 3)
-  data/              tickets.csv, stations.csv, external_signals.csv
-  core/
-    forecast.py      forecast_demand, load_external (Dev 1)
-    inventory.py     aggregate_segments, build_seat_matrix, find_gaps (Dev 2)
-    policy.py        generate_policies (Dev 2)
-    simulate.py       simulate, run_baseline, rank_policies (Dev 2)
-    explain.py        explain (Dev 2)
-    mocks.py         mock forecast cho walking skeleton (Dev 2)
-  docs/screenshots/  ảnh chụp phiên AI collaboration
+gen_data.py         # sinh dataset mức ghế (nguồn sự thật duy nhất = data/tickets.csv)
+data/                # tickets.csv, stations.csv, external_signals.csv
+core/
+  inventory.py       # (Dev 2, thật) aggregate_segments, build_seat_matrix, find_gaps
+  policy.py           # (Dev 2, thật) generate_policies (safety_margin + bottleneck penalty)
+  simulate.py          # (Dev 2, thật) simulate, run_baseline, rank_policies (Monte Carlo)
+  explain.py            # (Dev 2, thật) explain — template tiếng Việt
+  forecast.py            # (Dev 1/Dev 3) load_external + forecast_demand (seasonal + MA)
+  overlay.py               # (Dev 3, UI-only) apply_policy_overlay — phủ HELD cho heatmap
+  reference_data.py          # (Dev 3, nội bộ) ga/toa/ghế dùng để SINH data, không phải contract
+app.py               # Hero Screen dashboard (Streamlit) — chỉ gọi core/, không sửa logic Dev 2
+tests/smoke_test.py  # smoke test chính thức của Dev 2 (schema/hành vi, không phụ thuộc mock)
+scripts/             # apptest headless cho app.py (Dev 3)
 ```
 
-`tickets.csv` mức ghế là nguồn sự thật duy nhất — dữ liệu mức chặng luôn được
-derive qua `aggregate_segments()`, không sinh riêng.
+## Contract (khoá schema + chữ ký hàm)
+
+Nguồn sự thật duy nhất là `data/tickets.csv` ở **mức ghế**. Mọi số liệu mức chặng đều
+`derive` qua `core.aggregate_segments()` — không có bảng mức chặng riêng.
+
+**Quan trọng:** `origin_station`/`destination_station` trong tickets.csv, và mọi
+`gap_from`/`gap_to`/`origin`/`destination` xuyên suốt `core/`, đều là **TÊN GA**
+(khớp cột `name` của `stations.csv`, vd `"Hà Nội"`, `"Vinh"`) — **không phải**
+`station_id` (`"HN"`, `"VIH"`). `core/inventory.py` nối chặng bằng tên ga; sai chỗ
+này thì occupancy im lặng về 0 ở mọi chặng (không báo lỗi) — xem lịch sử fix trong
+commit log nếu cần chi tiết.
+
+```python
+load_external(depart_date) -> dict
+forecast_demand(hist_df, depart_date, external) -> DataFrame        # origin/destination = tên ga
+aggregate_segments(tickets_df, train, date) -> DataFrame
+build_seat_matrix(tickets_df, train, date) -> DataFrame              # index=seat_id, cột="A → B", SOLD/EMPTY
+find_gaps(seat_matrix) -> DataFrame                                    # gap ghép được (Gap Engine)
+generate_policies(forecast_df, seat_matrix) -> list[dict]               # Conservative/Balanced/Aggressive
+simulate(policy, forecast_df, seat_matrix, n_runs=200) -> dict            # Monte Carlo
+run_baseline(forecast_df, seat_matrix) -> dict                              # baseline Sell-now (gọi simulate())
+rank_policies(sim_results: list[dict]) -> DataFrame
+explain(policy, sim_result, baseline_result, forecast_df) -> dict             # 6 field, đều là string
+apply_policy_overlay(seat_matrix, policy) -> DataFrame                          # (Dev 3) phủ HELD cho UI
+```
+
+`policy["name"]` là `"Conservative"/"Balanced"/"Aggressive"` (tiếng Anh) — app.py tự
+map sang nhãn tiếng Việt (`POLICY_LABEL_VI`) để hiển thị, không đổi ở core.
+
+## Kiểm thử nhanh (không cần trình duyệt)
+
+```bash
+python tests/smoke_test.py            # smoke test chính thức của Dev 2: schema + hành vi core/
+python scripts/apptest_app.py         # headless UI test: Approve / Override / chọn policy
+```
+
+## Demo flow (bất khả xâm phạm, ~3 click / 30-60s)
+
+1. Click mác tàu nhấp nháy đỏ trong Exception Alert Feed (mặc định đã chọn sẵn ngày/tàu
+   có sự cố quỹ ghế nặng nhất).
+2. Xem heatmap tải theo chặng + 3 thẻ chính sách đối chiếu Baseline + Gap List.
+3. Xem Explainability Panel (rủi ro + độ tin cậy luôn hiển thị) rồi bấm **APPROVE**
+   hoặc **OVERRIDE** (chọn lý do bắt buộc) → ghi Audit Log.
+
+## Deploy lên Streamlit Community Cloud
+
+1. Push repo này lên GitHub (public).
+2. Vào https://share.streamlit.io → New app → chọn repo, branch, file chính `app.py`.
+3. Deploy — lấy Live URL, dùng URL đó để demo (không demo localhost).

@@ -1,0 +1,9 @@
+﻿station_id,name,km_from_hanoi,order
+HN,Hà Nội,0,0
+THA,Thanh Hóa,175,1
+VIH,Vinh,319,2
+DHO,Đồng Hới,522,3
+HUE,Huế,688,4
+DNG,Đà Nẵng,791,5
+NTR,Nha Trang,1315,6
+SGN,Sài Gòn,1726,7
