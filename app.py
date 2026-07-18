@@ -3,9 +3,16 @@ Vietnam Railway United — Decision Copilot
 Hero Screen 1 màn hình. Streamlit monolith, gọi thẳng các hàm core/ (không REST/login).
 Luồng demo: click SE3 đỏ -> xem heatmap + 3 policy vs baseline -> xem rủi ro + độ tin
 cậy -> Approve/Override + audit log.
+
+core/ (inventory.py, policy.py, simulate.py, explain.py) là code THẬT của Dev 2,
+không sửa ở đây. seat_matrix index=seat_id, cột=tên chặng "A → B" (core.inventory.
+SEG_SEP); Policy là dict (name/hold_seats/price_multiplier/open_quota_at/gap_fills/
+last_call_hours/fit_context/safety_margin); gap_from/gap_to/origin/destination đều
+là TÊN GA (không phải mã ga).
 """
 from __future__ import annotations
 import datetime as dt
+import re
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -15,12 +22,12 @@ from core import (
     find_gaps, generate_policies, apply_policy_overlay, simulate, run_baseline,
     rank_policies, explain,
 )
-from core.reference_data import STATION_NAME, TRAINS, ORDERED_STATION_IDS
 from core.utils import fmt_vnd, fmt_pct
 
 OVERRIDE_REASONS = ["Thiên tai", "An sinh xã hội", "Lỗi hệ thống", "Nghi ngờ đầu cơ"]
-POLICY_ORDER = ["conservative", "balanced", "aggressive"]
-POLICY_COLOR = {"conservative": "#0284c7", "balanced": "#7c3aed", "aggressive": "#dc2626"}
+POLICY_LABEL_VI = {"Conservative": "Thận trọng", "Balanced": "Cân bằng", "Aggressive": "Quyết liệt"}
+POLICY_ICON = {"Conservative": "🔵", "Balanced": "🟣", "Aggressive": "🔴"}
+PRICE_CEILING_MULT = 1.20  # giá trần Nhà nước: không vượt quá +20% giá vé cơ sở
 
 st.set_page_config(
     page_title="VRU — Decision Copilot", page_icon="🚆", layout="wide",
@@ -69,6 +76,18 @@ div.st-key-override_btn button:hover { background-color:#b91c1c !important; }
 """, unsafe_allow_html=True)
 
 
+def _coach_of(seat_id: str) -> int:
+    """'T3-15' -> 3. Seat_matrix của core.inventory không mang coach/seat_class
+    (chỉ index=seat_id), nên tách trực tiếp từ seat_id theo format Txx-yy."""
+    m = re.match(r"T(\d+)-", str(seat_id))
+    return int(m.group(1)) if m else 0
+
+
+def _seat_no(seat_id: str) -> str:
+    m = re.search(r"-(\d+)$", str(seat_id))
+    return m.group(1) if m else str(seat_id)
+
+
 # ============================================================ DATA ============================================================
 @st.cache_data
 def load_tickets() -> pd.DataFrame:
@@ -86,7 +105,7 @@ def train_status_table(tickets: pd.DataFrame, train: str) -> pd.DataFrame:
         top = seg.loc[seg["occupancy"].idxmax()]
         rows.append({
             "date": d, "max_occupancy": top["occupancy"],
-            "bottleneck": f"{STATION_NAME[top['from_station']]}–{STATION_NAME[top['to_station']]}",
+            "bottleneck": f"{top['from_station']}–{top['to_station']}",
         })
     return pd.DataFrame(rows)
 
@@ -100,17 +119,22 @@ def run_pipeline(tickets: pd.DataFrame, train: str, date: str):
     fc = forecast_demand(tickets, date, ext)
     policies = generate_policies(fc, matrix)
     baseline = run_baseline(fc, matrix)
-    sims = {p.name: simulate(p, fc, matrix, n_runs=200) for p in policies}
-    ranking = rank_policies(sims)
-    return ext, seg_df, matrix, gaps, fc, policies, baseline, sims, ranking
+    sims = {p["name"]: simulate(p, fc, matrix, n_runs=200) for p in policies}
+    ranked = rank_policies([{"name": p["name"], **sims[p["name"]]} for p in policies])
+    return ext, seg_df, matrix, gaps, fc, policies, baseline, sims, ranked
 
 
 tickets = load_tickets()
+TRAINS = sorted(tickets["train_id"].unique())
+
+# seat_class không còn trong seat_matrix (core.inventory chỉ trả SOLD/EMPTY theo
+# seat_id) — tra riêng từ tickets.csv để hiển thị trong bảng ghế giữ.
+SEAT_CLASS_MAP = tickets.drop_duplicates("seat_id").set_index("seat_id")["seat_class"].to_dict()
 
 # ============================================================ SESSION STATE ============================================================
 st.session_state.setdefault("train", "SE3" if "SE3" in TRAINS else TRAINS[0])
 st.session_state.setdefault("audit_log", [])
-st.session_state.setdefault("selected_policy", "balanced")
+st.session_state.setdefault("selected_policy", "Balanced")
 st.session_state.setdefault("last_toast", None)
 
 # tìm ngày "sự cố" mạnh nhất của từng tàu để làm mặc định ngày khởi hành
@@ -150,10 +174,11 @@ depart_date = st.session_state["depart_date"]
 st.divider()
 
 ext, seg_df, matrix, gaps, fc, policies, baseline, sims, ranking = run_pipeline(tickets, train, depart_date)
-policy_map = {p.name: p for p in policies}
+policy_map = {p["name"]: p for p in policies}
 
 # Ma trận gốc (build_seat_matrix) chỉ có SOLD/EMPTY. HELD được phủ lên riêng cho
-# TỪNG policy qua apply_policy_overlay — heatmap dưới đây phản ánh policy đang chọn.
+# TỪNG policy qua apply_policy_overlay (core/overlay.py, Dev 3) — heatmap dưới đây
+# phản ánh policy đang chọn, không sửa core/inventory.py.
 heatmap_policy = policy_map[st.session_state["selected_policy"]]
 overlay_matrix = apply_policy_overlay(matrix, heatmap_policy)
 
@@ -177,7 +202,7 @@ with left:
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(f"#### 🗺️ Heatmap tải theo chặng — {train} · {depart_date}")
-    seg_labels = [f"{STATION_NAME[r.from_station]}→{STATION_NAME[r.to_station]}" for r in seg_df.itertuples()]
+    seg_labels = list(seg_df["segment_id"] + ": " + seg_df["from_station"] + "→" + seg_df["to_station"])
     fig_seg = go.Figure(data=go.Heatmap(
         z=[seg_df["occupancy"].tolist()],
         x=seg_labels, y=["Tỉ lệ lấp đầy"],
@@ -189,11 +214,13 @@ with left:
     fig_seg.update_layout(height=140, margin=dict(l=4, r=4, t=4, b=4))
     st.plotly_chart(fig_seg, width="stretch", config={"displayModeBar": False})
 
-    seg_ids = list(seg_df["segment_id"])
+    seg_cols = list(seg_df["from_station"] + " → " + seg_df["to_station"])  # khớp core.inventory.SEG_SEP
+    coach_matrix = overlay_matrix.reset_index().rename(columns={"index": "seat_id"})
+    coach_matrix["coach"] = coach_matrix["seat_id"].map(_coach_of)
     CELL_SCORE = {"EMPTY": 0.0, "HELD": 0.5, "SOLD": 1.0}
-    coach_score = overlay_matrix.groupby("coach")[seg_ids].apply(
+    coach_score = coach_matrix.groupby("coach")[seg_cols].apply(
         lambda d: d.apply(lambda col: col.map(CELL_SCORE)).mean()
-    )
+    ).sort_index()
     fig_coach = go.Figure(data=go.Heatmap(
         z=coach_score.values, x=seg_labels, y=[f"Toa {c}" for c in coach_score.index],
         colorscale=[[0, "#bbf7d0"], [0.5, "#93c5fd"], [1, "#dc2626"]], zmin=0, zmax=1,
@@ -203,31 +230,31 @@ with left:
     fig_coach.update_layout(height=340, margin=dict(l=4, r=4, t=10, b=4))
     st.caption(
         f"Ô đỏ = cháy vé (SOLD) · Ô xanh dương = đang GIỮ theo chính sách "
-        f"**{heatmap_policy.label_vi}** (chặng {heatmap_policy.hold_segment_label}) · "
-        f"Ô xanh nhạt = còn trống (EMPTY, khuyến mãi được). % hiển thị = tỉ lệ SOLD "
-        f"trong toa (giữ được tính 0.5) — đổi ở thẻ chính sách bên dưới để xem toa khác giữ ghế nào."
+        f"**{POLICY_LABEL_VI[heatmap_policy['name']]}** · Ô xanh nhạt = còn trống (EMPTY). "
+        f"% hiển thị = tỉ lệ SOLD trong toa (giữ được tính 0.5) — đổi ở thẻ chính sách bên "
+        f"dưới để xem toa khác giữ ghế nào."
     )
     st.plotly_chart(fig_coach, width="stretch", config={"displayModeBar": False})
 
-    held_rows = overlay_matrix[overlay_matrix[heatmap_policy.hold_segment_id] == "HELD"] \
-        if heatmap_policy.hold_segment_id in overlay_matrix.columns else overlay_matrix.iloc[0:0]
-    if len(held_rows):
-        with st.expander(f"🔒 {len(held_rows)} ghế đang GIỮ ở chặng {heatmap_policy.hold_segment_label} (policy: {heatmap_policy.label_vi})"):
-            st.dataframe(
-                held_rows[["seat_id", "coach", "seat_class"]].rename(
-                    columns={"seat_id": "Ghế", "coach": "Toa", "seat_class": "Hạng ghế"}
-                ),
-                hide_index=True, width="stretch", height=200,
-            )
+    held_mask = (overlay_matrix == "HELD").any(axis=1)
+    held_seat_ids = overlay_matrix.index[held_mask].tolist()
+    if held_seat_ids:
+        held_df = pd.DataFrame({
+            "Ghế": held_seat_ids,
+            "Toa": [_coach_of(s) for s in held_seat_ids],
+            "Hạng ghế": [SEAT_CLASS_MAP.get(s, "-") for s in held_seat_ids],
+        })
+        with st.expander(f"🔒 {len(held_df)} ghế đang GIỮ (policy: {POLICY_LABEL_VI[heatmap_policy['name']]})"):
+            st.dataframe(held_df, hide_index=True, width="stretch", height=200)
 
 # ============================================================ CENTER: 3 POLICY CARDS + RANKING ============================================================
 with center:
     st.markdown("#### 📋 3 Chính sách đề xuất (so với Baseline Bán-ngay)")
     cards = st.columns(3)
-    rank_by_policy = dict(zip(ranking["policy"], ranking["rank"]))
+    rank_by_policy = dict(zip(ranking["name"], ranking["rank"]))
 
-    for col, pname in zip(cards, POLICY_ORDER):
-        p = policy_map[pname]
+    for col, p in zip(cards, policies):
+        pname = p["name"]
         sim = sims[pname]
         rk = rank_by_policy.get(pname, 3)
         delta_pct = (sim["revenue"] - baseline["revenue"]) / baseline["revenue"] if baseline["revenue"] else 0
@@ -235,32 +262,31 @@ with center:
             card_class = "policy-card rank1" if rk == 1 else "policy-card"
             st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
             crown = " 🏆" if rk == 1 else ""
-            st.markdown(f"**{p.label_vi}{crown}**  \n`#{rk}`")
+            st.markdown(f"**{POLICY_ICON[pname]} {POLICY_LABEL_VI[pname]}{crown}**  \n`#{rk}`")
             st.metric("Doanh thu kỳ vọng", fmt_vnd(sim["revenue"]), f"{delta_pct*100:+.1f}% vs baseline")
             st.write(f"Lấp đầy: **{fmt_pct(sim['occupancy'],1)}** · Pax-km: **{sim['pax_km']:,.0f}**")
             st.write(
                 f"<span class='badge badge-conf'>Tin cậy {fmt_pct(sim['confidence'],0)}</span> "
-                f"<span class='badge badge-risk'>Rủi ro {fmt_vnd(sim['risk'])}</span>",
+                f"<span class='badge badge-risk'>Biến động ±{fmt_vnd(sim['risk'])}</span>",
                 unsafe_allow_html=True,
             )
-            st.caption("💡 " + {
-                "conservative": "Hợp lúc: ngày thường, cầu thấp, cần chắc chắn.",
-                "balanced": "Hợp lúc: vận hành thông thường, cân bằng rủi ro.",
-                "aggressive": "Hợp lúc: cao điểm lễ/Tết, cầu vượt cung.",
-            }[pname])
-            if st.button(f"Chọn để xem giải thích", key=f"select_{pname}", width="stretch"):
+            st.caption(f"💡 {p['fit_context']}")
+            quota_txt = "ngay bây giờ" if p["open_quota_at"] == 0 else f"{p['open_quota_at']}h trước giờ khởi hành"
+            st.caption(f"Mở lại quota: **{quota_txt}** · Last-call: **{p['last_call_hours']}h** trước giờ chạy")
+            if st.button("Chọn để xem giải thích", key=f"select_{pname}", width="stretch"):
                 st.session_state["selected_policy"] = pname
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("##### Bảng xếp hạng")
     show_rank = ranking.copy()
+    show_rank["Chính sách"] = show_rank["name"].map(POLICY_LABEL_VI)
     show_rank["revenue"] = show_rank["revenue"].map(fmt_vnd)
     show_rank["occupancy"] = show_rank["occupancy"].map(lambda v: fmt_pct(v, 1))
     show_rank["risk"] = show_rank["risk"].map(fmt_vnd)
     show_rank["confidence"] = show_rank["confidence"].map(lambda v: fmt_pct(v, 0))
     show_rank["pax_km"] = show_rank["pax_km"].map(lambda v: f"{v:,.0f}")
-    st.dataframe(show_rank[["rank", "policy", "revenue", "occupancy", "pax_km", "risk", "confidence"]],
+    st.dataframe(show_rank[["rank", "Chính sách", "revenue", "occupancy", "pax_km", "risk", "confidence"]],
                  hide_index=True, width="stretch")
 
 st.divider()
@@ -273,13 +299,17 @@ selected_policy = policy_map[selected_name]
 selected_sim = sims[selected_name]
 explanation = explain(selected_policy, selected_sim, baseline, fc)
 
+compliant = selected_policy["price_multiplier"] <= PRICE_CEILING_MULT
+compliance_note = (
+    f"✓ Tuân thủ giá trần Nhà nước (≤ +{fmt_pct(PRICE_CEILING_MULT - 1, 0)})" if compliant else
+    f"✗ VƯỢT giá trần Nhà nước (đang +{fmt_pct(selected_policy['price_multiplier'] - 1, 0)})"
+)
+
 with exp_col:
-    st.markdown(f"#### 🔎 Explainability Panel — {selected_policy.label_vi}")
-    conf_val = explanation["confidence"]["value"]
-    compliant_badge = "badge-compliant" if explanation["compliant"] else "badge-noncompliant"
+    st.markdown(f"#### 🔎 Explainability Panel — {POLICY_LABEL_VI[selected_name]}")
     st.markdown(
-        f"<span class='badge badge-conf'>{explanation['confidence']['label']}</span> "
-        f"<span class='badge {compliant_badge}'>{explanation['compliance']}</span>",
+        f"<span class='badge badge-conf'>Độ tin cậy {explanation['confidence']}</span> "
+        f"<span class='badge {'badge-compliant' if compliant else 'badge-noncompliant'}'>{compliance_note}</span>",
         unsafe_allow_html=True,
     )
     st.write("")
@@ -292,18 +322,21 @@ with exp_col:
 with gap_col:
     st.markdown(f"#### 🧩 Gap Engine — AI tìm được {len(gaps)} khoảng ghép được")
     if len(gaps):
-        top_gap = gaps.iloc[0]
+        # Ưu tiên nêu ví dụ Ghế 15 toa 3 (Hero Decision) nếu có trong danh sách,
+        # vì find_gaps() không đảm bảo thứ tự và các gap Vinh-Huế có extra_revenue
+        # bằng nhau (route_fare không phụ thuộc hạng ghế) nên sort không tách được.
+        headline = gaps[gaps["seat_id"] == "T3-15"]
+        top_gap = headline.iloc[0] if len(headline) else gaps.iloc[0]
         st.info(
-            f"VD: Ghế {top_gap['seat_id'].split('-')[-1]}, toa {top_gap['coach']}, "
-            f"chặng {STATION_NAME[top_gap['gap_from']]}–{STATION_NAME[top_gap['gap_to']]}, "
-            f"+{fmt_vnd(top_gap['extra_revenue'])}"
+            f"VD: Ghế {_seat_no(top_gap['seat_id'])}, toa {_coach_of(top_gap['seat_id'])}, "
+            f"chặng {top_gap['gap_from']}–{top_gap['gap_to']}, +{fmt_vnd(top_gap['extra_revenue'])}"
         )
         show_gaps = gaps.copy()
-        show_gaps["seat"] = show_gaps["seat_id"] + " (toa " + show_gaps["coach"].astype(str) + ")"
-        show_gaps["chặng"] = show_gaps["gap_from"].map(STATION_NAME) + "–" + show_gaps["gap_to"].map(STATION_NAME)
+        show_gaps["seat"] = show_gaps["seat_id"] + " (toa " + show_gaps["seat_id"].map(_coach_of).astype(str) + ")"
+        show_gaps["chặng"] = show_gaps["gap_from"] + "–" + show_gaps["gap_to"]
         show_gaps["+doanh thu"] = show_gaps["extra_revenue"].map(fmt_vnd)
-        show_gaps["khớp cầu"] = show_gaps["matched_demand"].map(lambda v: fmt_pct(v, 0))
-        st.dataframe(show_gaps[["seat", "chặng", "khớp cầu", "+doanh thu"]], hide_index=True,
+        show_gaps["ghế khác đã bán trọn gap"] = show_gaps["matched_demand"]
+        st.dataframe(show_gaps[["seat", "chặng", "ghế khác đã bán trọn gap", "+doanh thu"]], hide_index=True,
                      width="stretch", height=260)
     else:
         st.write("Không tìm thấy khoảng ghép được cho chuyến/ngày này.")
@@ -311,7 +344,7 @@ with gap_col:
 st.divider()
 
 # ============================================================ APPROVE / OVERRIDE ============================================================
-st.markdown(f"### ✅ Quyết định cho: {selected_policy.label_vi} — {train} · {depart_date}")
+st.markdown(f"### ✅ Quyết định cho: {POLICY_LABEL_VI[selected_name]} — {train} · {depart_date}")
 
 if st.session_state["last_toast"]:
     st.success(st.session_state["last_toast"])
@@ -321,7 +354,7 @@ with btn_col1:
     if st.button("✅ APPROVE — Duyệt chính sách", key="approve_btn", width="stretch"):
         st.session_state["audit_log"].append({
             "timestamp": dt.datetime.now().isoformat(sep=" ", timespec="seconds"),
-            "train": train, "date": depart_date, "policy": selected_policy.label_vi,
+            "train": train, "date": depart_date, "policy": POLICY_LABEL_VI[selected_name],
             "action": "APPROVE", "reason": "-",
         })
         msg = "Đã cập nhật chính sách vào hệ thống dsvn.vn thành công."
@@ -336,7 +369,7 @@ with btn_col2:
 
 @st.dialog("Lý do Override")
 def override_dialog():
-    st.write(f"Override chính sách **{selected_policy.label_vi}** cho **{train} · {depart_date}**.")
+    st.write(f"Override chính sách **{POLICY_LABEL_VI[selected_name]}** cho **{train} · {depart_date}**.")
     reason = st.selectbox(
         "Lý do (bắt buộc chọn)", OVERRIDE_REASONS, index=None,
         placeholder="-- Chọn lý do --", key="override_reason",
@@ -346,7 +379,7 @@ def override_dialog():
         if st.button("Xác nhận Override", type="primary", width="stretch", disabled=(reason is None)):
             st.session_state["audit_log"].append({
                 "timestamp": dt.datetime.now().isoformat(sep=" ", timespec="seconds"),
-                "train": train, "date": depart_date, "policy": selected_policy.label_vi,
+                "train": train, "date": depart_date, "policy": POLICY_LABEL_VI[selected_name],
                 "action": "OVERRIDE", "reason": reason,
             })
             st.session_state["last_toast"] = f"Đã ghi nhận OVERRIDE — lý do: {reason}."

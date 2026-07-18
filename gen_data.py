@@ -1,7 +1,13 @@
 """
 Sinh dữ liệu demo mức GHẾ cho Vietnam Railway United (VAIC 2026).
 Nguồn sự thật duy nhất = tickets.csv (mức ghế). Mọi số liệu chặng phải derive
-qua core/segments.aggregate_segments() — KHÔNG cấy sẵn số liệu chặng ở đây.
+qua core.inventory.aggregate_segments() — KHÔNG cấy sẵn số liệu chặng ở đây.
+
+QUAN TRỌNG: core/inventory.py (Dev 2) nối chặng bằng TÊN GA (cột "name" của
+stations.csv), không phải station_id — nên origin_station/destination_station
+trong tickets.csv PHẢI là tên ga (vd "Hà Nội", "Vinh"), không phải mã ga
+("HN", "VIH"). station_id chỉ dùng nội bộ ở gen_data.py này (tra cứu order/
+khoảng cách/hạng giá) — không ghi ra tickets.csv.
 
 Output: data/stations.csv, data/external_signals.csv, data/tickets.csv
 
@@ -13,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from core.reference_data import (
-    STATIONS_DF, TRAINS, HUB_WEIGHT, FARE_PER_KM,
+    STATIONS_DF, TRAINS, HUB_WEIGHT, FARE_PER_KM, STATION_NAME,
     get_seat_catalog, get_segments, distance_km, n_segments,
     ORDERED_STATION_IDS,
 )
@@ -181,8 +187,8 @@ def _make_ticket(counter, train, depart_date, seat_id, seat_class, origin, desti
         "departure_time": TRAIN_DEPART_TIME[train],
         "seat_id": seat_id,
         "seat_class": seat_class,
-        "origin_station": origin,
-        "destination_station": destination,
+        "origin_station": STATION_NAME[origin],
+        "destination_station": STATION_NAME[destination],
         "price": round(price, -2),  # làm tròn trăm đồng
         "status": status,
         "booking_timestamp": booking_ts.isoformat(sep=" "),
@@ -334,21 +340,23 @@ def main():
     print("\n--- head tickets.csv ---")
     print(tickets.head(8).to_string())
 
-    print("\n--- kiểm tra showcase: SE3 ngày", SHOWCASE_DATE.isoformat(), "---")
+    print("\n--- kiểm tra showcase: SE3 ngày", SHOWCASE_DATE.isoformat(), "--- (dùng chính core.inventory thật)")
+    from core.inventory import aggregate_segments, build_seat_matrix, find_gaps
     show = tickets[(tickets.train_id == SHOWCASE_TRAIN) & (tickets.date == SHOWCASE_DATE.isoformat())]
     print(f"số dòng vé: {len(show)}, số ghế có vé: {show['seat_id'].nunique()} / 300")
 
-    # kiểm tra aggregate segment occupancy thủ công (không phụ thuộc core/segments.py)
-    booked = show[show.status == "booked"]
-    order = {sid: i for i, sid in enumerate(ORDERED_STATION_IDS)}
-    for seg_idx in range(N_SEG):
-        seg_from, seg_to = ORDERED_STATION_IDS[seg_idx], ORDERED_STATION_IDS[seg_idx + 1]
-        covers = booked[(booked.origin_station.map(order) <= seg_idx) &
-                         (booked.destination_station.map(order) >= seg_idx + 1)]
-        n_seats_cover = covers["seat_id"].nunique()
-        occ = n_seats_cover / 300
-        tag = "  <=== BOTTLENECK" if seg_idx in (2, 3) else ""
-        print(f"  SEG{seg_idx} {seg_from}->{seg_to}: {n_seats_cover}/300 = {occ:.1%}{tag}")
+    seg = aggregate_segments(tickets, SHOWCASE_TRAIN, SHOWCASE_DATE.isoformat())
+    print(seg.to_string(index=False))
+    bottleneck = seg[seg.occupancy >= 0.9]
+    assert len(bottleneck) >= 2, "BOTTLENECK KHONG XUAT HIEN qua core.inventory that!"
+    print("OK: bottleneck >=90% xuat hien qua aggregate_segments() that cua Dev 2.")
+
+    matrix = build_seat_matrix(tickets, SHOWCASE_TRAIN, SHOWCASE_DATE.isoformat())
+    gaps = find_gaps(matrix)
+    assert "T3-15" in gaps["seat_id"].values, "T3-15 KHONG duoc find_gaps() that tim thay!"
+    t15 = gaps[gaps.seat_id == "T3-15"].iloc[0]
+    print(f"OK: gap T3-15 tim thay qua find_gaps() that: {t15.gap_from} -> {t15.gap_to}, "
+          f"+{t15.extra_revenue:,.0f}đ")
 
     print("\n--- ví dụ gap kẹp giữa: seat T3-15 ngày showcase ---")
     print(show[show.seat_id == "T3-15"][

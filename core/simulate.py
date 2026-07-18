@@ -1,127 +1,192 @@
+"""core/simulate.py — simulate (bottleneck penalty + last-call, Monte Carlo
+confidence) → run_baseline (gọi CHÍNH simulate() với policy Sell-now, KHÔNG viết
+hàm mô phỏng thứ hai — so táo với táo) → rank_policies (weighted score).
 """
-simulate — Monte Carlo đơn giản (~200 lần) so sánh doanh thu chắc chắn (đã bán) với
-phần doanh thu KHÔNG chắc chắn (ghế đang giữ + gap ghép được), mỗi phần được "tung
-xu" theo xác suất (confidence / matched_demand) của nó ở mỗi lần chạy.
-
-run_baseline = chính sách "Bán ngay" (không giữ ghế, không chủ động ghép gap) — dùng
-làm mốc đối chiếu cho 3 policy.
-"""
-from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .contracts import Policy
-from .reference_data import FARE_PER_KM, get_segments, distance_km
+from core.inventory import SEG_SEP, distance_km, route_fare, segments_between
+from core.policy import score_gaps
+
+_NOISE_PCT = 0.15  # Monte Carlo: nhiễu ±15% vào p_long mỗi run (blueprint mục 12)
+_LAST_CALL_DISCOUNT = 0.7  # chiết khấu khi ép bán last-call (khách dài không tới)
+_GAP_FILL_COLUMNS = ["seat_id", "gap_from", "gap_to", "matched_demand", "extra_revenue"]
+
+_RANK_WEIGHTS = {"revenue": 0.5, "occupancy": 0.2, "confidence": 0.2, "risk": -0.1}
 
 
-def _matrix_revenue(seat_matrix: pd.DataFrame, price_multiplier: float = 1.0):
-    segs = get_segments()
-    revenue = 0.0
-    pax_km = 0.0
-    for _, seg in segs.iterrows():
-        sold = seat_matrix[seat_matrix[seg["segment_id"]] == "SOLD"]
-        if len(sold):
-            fare_per_km = sold["seat_class"].map(FARE_PER_KM)
-            revenue += float((fare_per_km * seg["distance_km"] * price_multiplier).sum())
-            pax_km += len(sold) * seg["distance_km"]
+def _sold_runs(seat_matrix: pd.DataFrame) -> list:
+    """Gộp các đoạn SOLD liên tục trên mỗi ghế thành 1 vé đã chốt (để tính doanh
+    thu/pax-km đã thu thật, không đổi theo policy)."""
+    columns = list(seat_matrix.columns)
+    segments = [tuple(col.split(SEG_SEP)) for col in columns]
+    n = len(columns)
+    runs = []
+    for seat_id, values in zip(seat_matrix.index, seat_matrix.values):
+        i = 0
+        while i < n:
+            if values[i] == "SOLD":
+                j = i
+                while j < n and values[j] == "SOLD":
+                    j += 1
+                runs.append((segments[i][0], segments[j - 1][1]))
+                i = j
+            else:
+                i += 1
+    return runs
+
+
+def _locked_in(seat_matrix: pd.DataFrame) -> tuple:
+    """→ (revenue, pax_km) từ các vé đã bán thật trong seat_matrix — không phụ
+    thuộc policy, giống nhau cho mọi policy và baseline."""
+    revenue = pax_km = 0.0
+    for frm, to in _sold_runs(seat_matrix):
+        revenue += route_fare(frm, to)
+        pax_km += distance_km(frm, to)
     return revenue, pax_km
 
 
-def simulate(policy: Policy, forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame, n_runs: int = 200) -> dict:
-    """→ {revenue, occupancy, pax_km, risk, confidence, timeline}"""
-    rng = np.random.default_rng(abs(hash(policy.name)) % (2**32 - 1))
-    segs = get_segments()
+def _sell_now_policy(forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame) -> dict:
+    """Policy Sell-now: safety_margin +inf -> không bao giờ giữ, mọi gap bán ngay.
+    Dùng để run_baseline() gọi CHÍNH simulate(), không viết mô phỏng thứ hai.
+    """
+    scored_gaps = score_gaps(forecast_df, seat_matrix)
+    gap_fills = scored_gaps.reindex(columns=_GAP_FILL_COLUMNS) if scored_gaps.empty else scored_gaps[_GAP_FILL_COLUMNS]
+    return {
+        "name": "Sell-now (baseline)",
+        "safety_margin": float("inf"),
+        "hold_seats": [],
+        "price_multiplier": 1.0,
+        "open_quota_at": 0,
+        "gap_fills": gap_fills,
+        "last_call_hours": 0,
+        "fit_context": "Baseline so sánh: bán ngay first-come-first-served, không giữ ghế nào.",
+    }
 
-    certain_revenue, certain_pax_km = _matrix_revenue(seat_matrix, policy.price_multiplier)
-    total_cells = len(seat_matrix) * len(segs)
-    n_sold_cells = int((seat_matrix[list(segs["segment_id"])] == "SOLD").to_numpy().sum())
 
-    # --- ghế đang giữ: cược khách đi dài chặng (upside) so với bán ngay ở chặng giữ (downside) ---
-    hold_seg_row = segs[segs["segment_id"] == policy.hold_segment_id]
-    hold_seats_df = seat_matrix[seat_matrix["seat_id"].isin(policy.hold_seats)]
-    n_hold = len(hold_seats_df)
+def simulate(policy: dict, forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame, n_runs: int = 200) -> dict:
+    """→ SimResult = {revenue, occupancy, pax_km, risk, confidence, timeline}.
+    Monte Carlo n_runs lần, mỗi lần nhiễu ±15% vào p_long của các ghế đang GIỮ.
+    confidence = tỉ lệ lần "giữ ghế" vẫn cho doanh thu kỳ vọng > "bán ngay" (mỗi
+    ghế giữ, nếu khách dài không tới trước last_call_hours, tự động last-call
+    bán chiết khấu — đúng luật last-call, không bịa số).
+    """
+    scored_gaps = score_gaps(forecast_df, seat_matrix)
+    base_revenue, base_pax_km = _locked_in(seat_matrix)
 
-    upside = np.zeros(n_hold)
-    downside = np.zeros(n_hold)
-    longhaul_dist = 0.0
-    if n_hold and len(hold_seg_row):
-        hold_seg = hold_seg_row.iloc[0]
-        seg_dist = hold_seg["distance_km"]
-        longhaul_dist = distance_km(hold_seg["from_station"], policy.hold_target_station) if policy.hold_target_station else seg_dist * 3
-        longhaul_dist = max(longhaul_dist, seg_dist)
-        for idx, (_, row) in enumerate(hold_seats_df.iterrows()):
-            fare_km = FARE_PER_KM[row["seat_class"]]
-            upside[idx] = fare_km * longhaul_dist * policy.price_multiplier
-            downside[idx] = fare_km * seg_dist  # giá trị chắc chắn nếu bán ngay, không giữ
+    gap_fills = policy["gap_fills"]
+    gap_fill_seats = set(gap_fills["seat_id"]) if not gap_fills.empty else set()
+    sellnow_rows = scored_gaps[scored_gaps["seat_id"].isin(gap_fill_seats)] if not scored_gaps.empty else scored_gaps
 
-    hold_p = float(policy.hold_confidence) if n_hold else 0.0
+    # Bán ngay = CHỈ chặng ngắn (hop đầu của gap, đúng định nghĩa Sell_score),
+    # KHÔNG phải nguyên chiều dài gap — nếu bán được trọn gap ngay lập tức thì
+    # không còn lý do gì để cân nhắc giữ ghế nữa.
+    sellnow_fill_revenue = 0.0
+    sellnow_fill_pax_km = 0.0
+    for _, row in sellnow_rows.iterrows():
+        sellnow_fill_revenue += row["short_fare"] * policy["price_multiplier"]
+        sellnow_fill_pax_km += distance_km(row["gap_from"], row["short_to"])
 
-    # --- gap ghép chặng ---
-    gap_upside = np.array([g["extra_revenue"] for g in policy.gap_fills], dtype=float)
-    gap_p = np.array([g["matched_demand"] for g in policy.gap_fills], dtype=float)
-    n_gap = len(gap_upside)
+    hold_set = set(policy["hold_seats"])
+    held_gaps = scored_gaps[scored_gaps["seat_id"].isin(hold_set)] if not scored_gaps.empty else scored_gaps
 
-    # --- Monte Carlo ---
-    revenue_runs = np.full(n_runs, certain_revenue, dtype=float)
-    filled_cells_runs = np.full(n_runs, n_sold_cells, dtype=float)
+    rng = np.random.default_rng()
+    revenue_samples = []
+    hold_wins = 0
 
-    if n_hold:
-        hold_success = rng.random((n_runs, n_hold)) < hold_p
-        revenue_runs += hold_success @ upside
-        filled_cells_runs += hold_success.sum(axis=1)  # 1 chặng/ghế mỗi lần thành công
+    for _ in range(max(n_runs, 1)):
+        run_revenue = base_revenue + sellnow_fill_revenue
+        run_sellnow_counterfactual = base_revenue + sellnow_fill_revenue
+        for _, row in held_gaps.iterrows():
+            noise = rng.uniform(1 - _NOISE_PCT, 1 + _NOISE_PCT)
+            p_long_noised = float(np.clip(row["p_long"] * noise, 0.0, 1.0))
+            if rng.random() < p_long_noised:
+                run_revenue += row["long_fare"] * policy["price_multiplier"]
+            else:
+                run_revenue += row["short_fare"] * _LAST_CALL_DISCOUNT  # last-call: khách dài không tới
+            run_sellnow_counterfactual += row["short_fare"]
 
-    if n_gap:
-        gap_success = rng.random((n_runs, n_gap)) < gap_p[None, :]
-        revenue_runs += gap_success @ gap_upside
-        # mỗi gap có thể trải nhiều chặng liền kề — ước lượng 2 chặng/gap trung bình
-        filled_cells_runs += gap_success.sum(axis=1) * 2
+        revenue_samples.append(run_revenue)
+        if run_revenue > run_sellnow_counterfactual:
+            hold_wins += 1
 
-    mean_revenue = float(revenue_runs.mean())
-    risk_amount = float(downside.sum())  # số tiền có thể mất nếu toàn bộ ghế giữ không bán được
-    occupancy = float(np.clip(filled_cells_runs.mean() / total_cells, 0, 1)) if total_cells else 0.0
+    revenue = float(np.mean(revenue_samples))
+    risk = float(np.std(revenue_samples))
+    confidence = 1.0 if held_gaps.empty else hold_wins / len(revenue_samples)
 
-    # Độ tin cậy phản ánh PHẦN QUYẾT ĐỊNH (giữ ghế + gap) — phần đã bán chắc chắn
-    # không cần "độ tin cậy" nên không hoà loãng vào đây.
-    upside_total = float(upside.sum())
-    gap_total = float(gap_upside.sum())
-    speculative_total = upside_total + gap_total
-    if speculative_total > 0:
-        conf_num = upside_total * hold_p + float((gap_upside * gap_p).sum())
-        confidence = float(np.clip(conf_num / speculative_total, 0.3, 0.95))
-    else:
-        confidence = 0.95  # không có phần đầu cơ nào (vd baseline) -> gần như chắc chắn
+    occupancy = _expected_occupancy(seat_matrix, sellnow_rows, held_gaps)
+    pax_km = base_pax_km + sellnow_fill_pax_km + _expected_held_pax_km(held_gaps)
 
-    avg_seg_dist = float(segs["distance_km"].mean())
-    pax_km = certain_pax_km
-    if n_hold:
-        pax_km += hold_p * n_hold * longhaul_dist
-    if n_gap:
-        pax_km += float((gap_p * 2 * avg_seg_dist).sum())
-
-    buckets = [14, 10, 7, 5, 3, 1, 0]
-    timeline = [{
-        "days_before_departure": b,
-        "revenue": round(certain_revenue + (mean_revenue - certain_revenue) * (1 - b / 14), -3),
-    } for b in buckets]
+    timeline = [
+        {"hours_before_departure": policy["open_quota_at"], "cumulative_revenue": round(base_revenue, 0)},
+        {"hours_before_departure": policy["last_call_hours"], "cumulative_revenue": round(base_revenue + sellnow_fill_revenue, 0)},
+        {"hours_before_departure": 0, "cumulative_revenue": round(revenue, 0)},
+    ]
 
     return {
-        "policy": policy.name,
-        "revenue": round(mean_revenue, -3),
-        "certain_revenue": round(certain_revenue, -3),
-        "occupancy": round(occupancy, 4),
-        "pax_km": round(pax_km, 1),
-        "risk": round(risk_amount, -3),
-        "confidence": round(confidence, 3),
+        "revenue": revenue,
+        "occupancy": occupancy,
+        "pax_km": pax_km,
+        "risk": risk,
+        "confidence": confidence,
         "timeline": timeline,
     }
 
 
+def _expected_occupancy(seat_matrix: pd.DataFrame, sellnow_rows: pd.DataFrame, held_gaps: pd.DataFrame) -> float:
+    """Occupancy trung bình theo chặng: nền hiện có + kỳ vọng đoạn được lấp thêm.
+    Bán ngay chỉ lấp ĐÚNG 1 hop (chặng ngắn); held kỳ vọng theo p_long — cả gap
+    nếu khách dài tới, chỉ 1 hop nếu last-call. Không lặp qua n_runs vì đây là kỳ
+    vọng tuyến tính, không cần Monte Carlo như revenue/confidence.
+    """
+    n_segments = len(seat_matrix.columns) or 1
+    capacity = len(seat_matrix) or 1
+    base_occ_sum = (seat_matrix == "SOLD").sum().sum()
+
+    filled_segment_units = float(len(sellnow_rows))  # mỗi hàng bán ngay lấp đúng 1 hop
+    if not held_gaps.empty:
+        for _, row in held_gaps.iterrows():
+            long_span = len(segments_between(row["gap_from"], row["gap_to"]))
+            filled_segment_units += row["p_long"] * long_span + (1 - row["p_long"]) * 1
+
+    return min((base_occ_sum + filled_segment_units) / (n_segments * capacity), 1.0)
+
+
+def _expected_held_pax_km(held_gaps: pd.DataFrame) -> float:
+    if held_gaps.empty:
+        return 0.0
+    pax_km = 0.0
+    for _, row in held_gaps.iterrows():
+        long_km = distance_km(row["gap_from"], row["gap_to"])
+        short_km = distance_km(row["gap_from"], row["short_to"])
+        pax_km += row["p_long"] * long_km + (1 - row["p_long"]) * short_km
+    return pax_km
+
+
 def run_baseline(forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame) -> dict:
-    """Baseline = Bán ngay: không giữ ghế, không chủ động ghép gap, giá chuẩn."""
-    baseline_policy = Policy(
-        name="baseline", label_vi="Bán ngay (Baseline)",
-        hold_seats=[], hold_segment_id="", hold_segment_label="",
-        hold_target_station="", hold_confidence=0.0,
-        price_multiplier=1.0, open_quota_at="Bán ngay toàn bộ", gap_fills=[],
-    )
-    return simulate(baseline_policy, forecast_df, seat_matrix, n_runs=1)
+    """→ SimResult. BASELINE = policy Sell-now, BẮT BUỘC gọi CHÍNH simulate() ở
+    trên — không viết hàm mô phỏng thứ hai, để so "táo với táo" (blueprint mục 6).
+    """
+    baseline_policy = _sell_now_policy(forecast_df, seat_matrix)
+    return simulate(baseline_policy, forecast_df, seat_matrix)
+
+
+def _normalize(series: pd.Series) -> pd.Series:
+    lo, hi = series.min(), series.max()
+    if hi == lo:
+        return pd.Series(1.0, index=series.index)
+    return (series - lo) / (hi - lo)
+
+
+def rank_policies(sim_results) -> pd.DataFrame:
+    """→ DataFrame [..., score, rank]. sim_results: list[dict] mỗi dict = {"name",
+    **SimResult}. Weighted score (revenue/occupancy/confidence dương, risk âm),
+    KHÔNG Pareto/NSGA. rank=1 là tốt nhất.
+    """
+    df = pd.DataFrame(sim_results)
+    score = pd.Series(0.0, index=df.index)
+    for metric, weight in _RANK_WEIGHTS.items():
+        score += weight * _normalize(df[metric])
+    df["score"] = score
+    df["rank"] = df["score"].rank(ascending=False, method="min").astype(int)
+    return df.sort_values("rank").reset_index(drop=True)

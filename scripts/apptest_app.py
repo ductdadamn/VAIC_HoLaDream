@@ -22,7 +22,7 @@ print("3) after OVERRIDE click, exceptions:", list(at.exception))
 print("   show_override_dialog:", at.session_state["show_override_dialog"])
 
 # chon 1 policy card khac
-select_buttons = [b for b in at.button if b.key == "select_aggressive"]
+select_buttons = [b for b in at.button if b.key == "select_Aggressive"]
 if select_buttons:
     select_buttons[0].click().run()
     print("4) after select aggressive policy, exceptions:", list(at.exception))

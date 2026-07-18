@@ -1,110 +1,124 @@
+"""core/policy.py — generate_policies: 3 policy sinh bằng ĐỔI safety_margin
+(KHÔNG code 3 nhánh riêng). Hold vs Sell dùng bottleneck penalty (blueprint mục
+11,12): GIỮ ghế nếu Hold_score > Sell_score × (1 + safety_margin).
 """
-generate_policies — sinh 3 chính sách Thận trọng / Cân bằng / Quyết liệt.
-Rule-based EMSR-inspired: giữ ghế ở chặng CÒN TRỐNG gần đầu tuyến để bảo vệ chỗ cho
-khách đi DÀI chặng (giá trị cao hơn) sẽ xuất hiện sau, thay vì bán rẻ ngay cho khách
-đi ngắn. Mức độ giữ (hold_ratio) + biên độ giá + ngưỡng chấp nhận gap tăng dần theo
-khẩu vị rủi ro (Thận trọng < Cân bằng < Quyết liệt).
-"""
-from __future__ import annotations
 import pandas as pd
 
-from .contracts import Policy
-from .reference_data import get_segments, STATION_ORDER, STATION_NAME
-from .segments import find_gaps
+from core.inventory import find_gaps, route_fare, segment_occupancy, segments_between
 
-_CONFIGS = [
-    # name,          label_vi,     hold_ratio, price_mult, gap_conf_threshold, open_quota_at
-    ("conservative", "Thận trọng", 0.05, 1.00, 0.75, "Mở bán ngay"),
-    ("balanced",     "Cân bằng",   0.18, 1.05, 0.55, "Mở lại 48 giờ trước giờ khởi hành"),
-    ("aggressive",   "Quyết liệt", 0.35, 1.12, 0.00, "Mở lại 24 giờ trước giờ khởi hành"),
+_BOTTLENECK_WEIGHT = 0.5
+_FALLBACK_CONFIDENCE = 0.3  # route không có trong forecast -> giả định cầu dài thấp
+_GAP_FILL_COLUMNS = ["seat_id", "gap_from", "gap_to", "matched_demand", "extra_revenue"]
+
+_POLICY_PRESETS = [
+    {
+        "name": "Conservative",
+        "safety_margin": 0.35,
+        "price_multiplier": 0.97,
+        "open_quota_at": 48,
+        "last_call_hours": 4,
+        "fit_context": (
+            "Hợp khi forecast độ tin cậy thấp, lịch sử biến động mạnh, thời tiết xấu, "
+            "tỉ lệ hủy vé tăng — ưu tiên bán ngay lấy tiền mặt."
+        ),
+    },
+    {
+        "name": "Balanced",
+        "safety_margin": 0.15,
+        "price_multiplier": 1.0,
+        "open_quota_at": 24,
+        "last_call_hours": 3,
+        "fit_context": (
+            "Hợp khi cầu bình thường, tín hiệu lẫn lộn, độ tin cậy trung bình — "
+            "điều chỉnh từ tốn theo booking pace."
+        ),
+    },
+    {
+        "name": "Aggressive",
+        "safety_margin": 0.05,
+        "price_multiplier": 1.08,
+        "open_quota_at": 12,
+        "last_call_hours": 2,
+        "fit_context": (
+            "Hợp khi cao điểm Tết/lễ/sự kiện, booking nhanh, độ tin cậy cao, ít áp lực "
+            "đối thủ — ôm ghế đón khách chặng dài giá cao."
+        ),
+    },
 ]
 
 
-def _pick_hold_segment(seat_matrix: pd.DataFrame, forecast_df: pd.DataFrame, segs: pd.DataFrame):
-    occ = {seg["segment_id"]: (seat_matrix[seg["segment_id"]] == "SOLD").mean() for _, seg in segs.iterrows()}
-    candidates = [seg for _, seg in segs.iterrows() if occ[seg["segment_id"]] < 0.75]
-    if not candidates:
-        candidates = [seg for _, seg in segs.iterrows()]
-
-    best_seg, best_score, best_row = None, -1.0, None
-    if forecast_df is not None and len(forecast_df):
-        fc = forecast_df.copy()
-        fc["dest_order"] = fc["destination"].map(STATION_ORDER)
-        fc["orig_order"] = fc["origin"].map(STATION_ORDER)
-        for seg in candidates:
-            origin = seg["from_station"]
-            sub = fc[(fc.origin == origin) & (fc.dest_order - fc.orig_order >= 3)]
-            if sub.empty:
-                continue
-            sub = sub.assign(score=sub.expected_pax * sub.confidence)
-            top = sub.sort_values("score", ascending=False).iloc[0]
-            if top["score"] > best_score:
-                best_score, best_seg, best_row = top["score"], seg, top
-
-    if best_seg is None:
-        best_seg = min(candidates, key=lambda s: occ[s["segment_id"]])
-
-    return best_seg, occ[best_seg["segment_id"]], best_row
+def _p_long_haul(forecast_df: pd.DataFrame, origin: str, destination: str) -> float:
+    match = forecast_df[(forecast_df["origin"] == origin) & (forecast_df["destination"] == destination)]
+    if match.empty:
+        return _FALLBACK_CONFIDENCE
+    return float(match.iloc[0]["confidence"])
 
 
-def generate_policies(forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame) -> list[Policy]:
-    segs = get_segments()
-    hold_seg, hold_occ, best_row = _pick_hold_segment(seat_matrix, forecast_df, segs)
+def _score_gap(gap_row, forecast_df: pd.DataFrame, occupancy: dict) -> pd.Series:
+    """Sell_score = giá vé chặng ngắn (hop đầu của gap, chắc chắn thu được).
+    Hold_score = P(khách dài, từ forecast) × giá vé chặng dài + bottleneck_penalty.
+    bottleneck_penalty tỉ lệ occupancy của chặng nghẽn nhất mà gap này đi qua
+    (occupancy càng cao, bán ngắn qua đó càng chặn mất vé dài giá cao).
+    """
+    gap_cols = segments_between(gap_row["gap_from"], gap_row["gap_to"])
+    bottleneck_occupancy = max((occupancy.get(col, 0.0) for col in gap_cols), default=0.0)
 
-    empty_in_seg = seat_matrix.loc[seat_matrix[hold_seg["segment_id"]] == "EMPTY", "seat_id"].tolist()
+    long_fare = route_fare(gap_row["gap_from"], gap_row["gap_to"])
+    first_from, first_to = gap_cols[0].split(" → ") if gap_cols else (gap_row["gap_from"], gap_row["gap_to"])
+    short_fare = route_fare(first_from, first_to)
 
-    if best_row is not None:
-        hold_target = best_row["destination"]
-        hold_confidence = float(best_row["confidence"])
-    else:
-        hold_target = STATION_ORDER and list(STATION_ORDER.keys())[-1]
-        hold_confidence = 0.6
+    p_long = _p_long_haul(forecast_df, gap_row["gap_from"], gap_row["gap_to"])
+    bottleneck_penalty = bottleneck_occupancy * long_fare * _BOTTLENECK_WEIGHT
+    hold_score = p_long * long_fare + bottleneck_penalty
+    return pd.Series({
+        "sell_score": short_fare,
+        "hold_score": hold_score,
+        "bottleneck_penalty": bottleneck_penalty,
+        "p_long": p_long,
+        "long_fare": long_fare,
+        "short_fare": short_fare,
+        "short_to": first_to,
+    })
 
-    all_gaps = find_gaps(seat_matrix)
 
-    hold_label = f"{STATION_NAME[hold_seg['from_station']]}–{STATION_NAME[hold_seg['to_station']]}"
+def score_gaps(forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame) -> pd.DataFrame:
+    """→ find_gaps() làm giàu thêm sell_score/hold_score/bottleneck_penalty/p_long/
+    long_fare/short_fare/short_to. Public để simulate.py dùng lại CHÍNH cách tính
+    này cho Monte Carlo (nhiễu p_long) thay vì tính lại từ đầu.
+    """
+    gaps = find_gaps(seat_matrix)
+    extra_cols = ["sell_score", "hold_score", "bottleneck_penalty", "p_long", "long_fare", "short_fare", "short_to"]
+    if gaps.empty:
+        return gaps.reindex(columns=[*gaps.columns, *extra_cols])
+    occupancy = segment_occupancy(seat_matrix)
+    scores = gaps.apply(lambda row: _score_gap(row, forecast_df, occupancy), axis=1)
+    return pd.concat([gaps, scores], axis=1)
+
+
+def generate_policies(forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame) -> list:
+    """→ list[Policy]. Policy = {name, safety_margin, hold_seats, price_multiplier,
+    open_quota_at, gap_fills, last_call_hours, fit_context}.
+    """
+    scored_gaps = score_gaps(forecast_df, seat_matrix)
 
     policies = []
-    for name, label, hold_ratio, price_mult, gap_thresh, quota in _CONFIGS:
-        n_hold = 0
-        if empty_in_seg:
-            n_hold = max(1, round(hold_ratio * len(empty_in_seg))) if hold_ratio > 0 else 0
-            n_hold = min(n_hold, len(empty_in_seg))
-        hold_seats = empty_in_seg[:n_hold]
-
-        if len(all_gaps):
-            gaps = all_gaps[all_gaps["matched_demand"] >= gap_thresh]
+    for preset in _POLICY_PRESETS:
+        margin = preset["safety_margin"]
+        if scored_gaps.empty:
+            hold_seats, gap_fills = [], scored_gaps.reindex(columns=_GAP_FILL_COLUMNS)
         else:
-            gaps = all_gaps
-        gap_fills = gaps.to_dict("records")
+            hold_mask = scored_gaps["hold_score"] > scored_gaps["sell_score"] * (1 + margin)
+            hold_seats = scored_gaps.loc[hold_mask, "seat_id"].tolist()
+            gap_fills = scored_gaps.loc[~hold_mask, _GAP_FILL_COLUMNS].reset_index(drop=True)
 
-        policies.append(Policy(
-            name=name,
-            label_vi=label,
-            hold_seats=hold_seats,
-            hold_segment_id=hold_seg["segment_id"],
-            hold_segment_label=hold_label,
-            hold_target_station=hold_target,
-            hold_confidence=hold_confidence,
-            price_multiplier=price_mult,
-            open_quota_at=quota,
-            gap_fills=gap_fills,
-        ))
+        policies.append({
+            "name": preset["name"],
+            "safety_margin": margin,
+            "hold_seats": hold_seats,
+            "price_multiplier": preset["price_multiplier"],
+            "open_quota_at": preset["open_quota_at"],
+            "gap_fills": gap_fills,
+            "last_call_hours": preset["last_call_hours"],
+            "fit_context": preset["fit_context"],
+        })
     return policies
-
-
-def apply_policy_overlay(seat_matrix: pd.DataFrame, policy: Policy) -> pd.DataFrame:
-    """Phủ HELD lên ma trận gốc CHO 1 POLICY CỤ THỂ — dùng để vẽ heatmap/UI theo
-    từng policy đang chọn.
-
-    build_seat_matrix() chỉ trả SOLD/EMPTY (dữ kiện đã bán, không phụ thuộc policy
-    nào). HELD không phải dữ kiện — nó là QUYẾT ĐỊNH của 1 policy (policy.hold_seats
-    tại policy.hold_segment_id), nên không thể nằm sẵn trong build_seat_matrix()
-    (hàm đó không nhận policy). Gọi hàm này SAU khi có seat_matrix + policy để lấy
-    ma trận hiển thị 3 trạng thái SOLD/HELD/EMPTY. Không chỉnh sửa seat_matrix gốc —
-    Gap Engine (find_gaps) vẫn phải chạy trên EMPTY thật, không bị HELD che mất."""
-    m = seat_matrix.copy()
-    if policy.hold_seats and policy.hold_segment_id and policy.hold_segment_id in m.columns:
-        mask = m["seat_id"].isin(policy.hold_seats)
-        m.loc[mask, policy.hold_segment_id] = "HELD"
-    return m
