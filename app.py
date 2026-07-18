@@ -12,7 +12,8 @@ import plotly.graph_objects as go
 
 from core import (
     load_external, forecast_demand, aggregate_segments, build_seat_matrix,
-    find_gaps, generate_policies, simulate, run_baseline, rank_policies, explain,
+    find_gaps, generate_policies, apply_policy_overlay, simulate, run_baseline,
+    rank_policies, explain,
 )
 from core.reference_data import STATION_NAME, TRAINS, ORDERED_STATION_IDS
 from core.utils import fmt_vnd, fmt_pct
@@ -151,6 +152,11 @@ st.divider()
 ext, seg_df, matrix, gaps, fc, policies, baseline, sims, ranking = run_pipeline(tickets, train, depart_date)
 policy_map = {p.name: p for p in policies}
 
+# Ma trận gốc (build_seat_matrix) chỉ có SOLD/EMPTY. HELD được phủ lên riêng cho
+# TỪNG policy qua apply_policy_overlay — heatmap dưới đây phản ánh policy đang chọn.
+heatmap_policy = policy_map[st.session_state["selected_policy"]]
+overlay_matrix = apply_policy_overlay(matrix, heatmap_policy)
+
 # ============================================================ LEFT: EXCEPTION FEED + HEATMAP ============================================================
 left, center = st.columns([1, 2])
 
@@ -184,16 +190,35 @@ with left:
     st.plotly_chart(fig_seg, width="stretch", config={"displayModeBar": False})
 
     seg_ids = list(seg_df["segment_id"])
-    coach_occ = matrix.groupby("coach")[seg_ids].apply(lambda d: (d == "SOLD").mean())
+    CELL_SCORE = {"EMPTY": 0.0, "HELD": 0.5, "SOLD": 1.0}
+    coach_score = overlay_matrix.groupby("coach")[seg_ids].apply(
+        lambda d: d.apply(lambda col: col.map(CELL_SCORE)).mean()
+    )
     fig_coach = go.Figure(data=go.Heatmap(
-        z=coach_occ.values, x=seg_labels, y=[f"Toa {c}" for c in coach_occ.index],
-        colorscale=[[0, "#bbf7d0"], [0.7, "#fde68a"], [1, "#dc2626"]], zmin=0, zmax=1,
-        text=[[fmt_pct(v, 0) for v in row] for row in coach_occ.values], texttemplate="%{text}",
-        colorbar=dict(title="Lấp đầy"),
+        z=coach_score.values, x=seg_labels, y=[f"Toa {c}" for c in coach_score.index],
+        colorscale=[[0, "#bbf7d0"], [0.5, "#93c5fd"], [1, "#dc2626"]], zmin=0, zmax=1,
+        text=[[fmt_pct(v, 0) for v in row] for row in coach_score.values], texttemplate="%{text}",
+        colorbar=dict(title="SOLD"),
     ))
     fig_coach.update_layout(height=340, margin=dict(l=4, r=4, t=10, b=4))
-    st.caption("Ô đỏ = cháy vé · Ô xanh nhạt = chặng khuyến mãi (theo toa)")
+    st.caption(
+        f"Ô đỏ = cháy vé (SOLD) · Ô xanh dương = đang GIỮ theo chính sách "
+        f"**{heatmap_policy.label_vi}** (chặng {heatmap_policy.hold_segment_label}) · "
+        f"Ô xanh nhạt = còn trống (EMPTY, khuyến mãi được). % hiển thị = tỉ lệ SOLD "
+        f"trong toa (giữ được tính 0.5) — đổi ở thẻ chính sách bên dưới để xem toa khác giữ ghế nào."
+    )
     st.plotly_chart(fig_coach, width="stretch", config={"displayModeBar": False})
+
+    held_rows = overlay_matrix[overlay_matrix[heatmap_policy.hold_segment_id] == "HELD"] \
+        if heatmap_policy.hold_segment_id in overlay_matrix.columns else overlay_matrix.iloc[0:0]
+    if len(held_rows):
+        with st.expander(f"🔒 {len(held_rows)} ghế đang GIỮ ở chặng {heatmap_policy.hold_segment_label} (policy: {heatmap_policy.label_vi})"):
+            st.dataframe(
+                held_rows[["seat_id", "coach", "seat_class"]].rename(
+                    columns={"seat_id": "Ghế", "coach": "Toa", "seat_class": "Hạng ghế"}
+                ),
+                hide_index=True, width="stretch", height=200,
+            )
 
 # ============================================================ CENTER: 3 POLICY CARDS + RANKING ============================================================
 with center:

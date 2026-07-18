@@ -50,8 +50,9 @@ def aggregate_segments(tickets_df: pd.DataFrame, train: str, date) -> pd.DataFra
 
 def build_seat_matrix(tickets_df: pd.DataFrame, train: str, date) -> pd.DataFrame:
     """→ [seat_id, coach, seat_class, SEG0..SEG6] — mỗi ô SOLD/EMPTY.
-    (HELD là trạng thái do POLICY quyết định sau này — xem policy.apply_policy_overlay;
-    ma trận gốc ở đây chỉ phản ánh dữ kiện đã bán, chưa áp chính sách giữ chỗ nào.)"""
+    HELD KHÔNG xuất hiện ở đây — ma trận gốc này không phụ thuộc policy nào, chỉ phản
+    ánh dữ kiện đã bán. Để lấy ma trận có HELD cho 1 policy cụ thể (vẽ heatmap/UI),
+    gọi core.policy.apply_policy_overlay(seat_matrix, policy) SAU hàm này."""
     segs = get_segments()
     catalog = get_seat_catalog(train)
     df = _filter_booked(tickets_df, train, date)

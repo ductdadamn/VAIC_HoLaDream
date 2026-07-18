@@ -91,3 +91,20 @@ def generate_policies(forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame) -> l
             gap_fills=gap_fills,
         ))
     return policies
+
+
+def apply_policy_overlay(seat_matrix: pd.DataFrame, policy: Policy) -> pd.DataFrame:
+    """Phủ HELD lên ma trận gốc CHO 1 POLICY CỤ THỂ — dùng để vẽ heatmap/UI theo
+    từng policy đang chọn.
+
+    build_seat_matrix() chỉ trả SOLD/EMPTY (dữ kiện đã bán, không phụ thuộc policy
+    nào). HELD không phải dữ kiện — nó là QUYẾT ĐỊNH của 1 policy (policy.hold_seats
+    tại policy.hold_segment_id), nên không thể nằm sẵn trong build_seat_matrix()
+    (hàm đó không nhận policy). Gọi hàm này SAU khi có seat_matrix + policy để lấy
+    ma trận hiển thị 3 trạng thái SOLD/HELD/EMPTY. Không chỉnh sửa seat_matrix gốc —
+    Gap Engine (find_gaps) vẫn phải chạy trên EMPTY thật, không bị HELD che mất."""
+    m = seat_matrix.copy()
+    if policy.hold_seats and policy.hold_segment_id and policy.hold_segment_id in m.columns:
+        mask = m["seat_id"].isin(policy.hold_seats)
+        m.loc[mask, policy.hold_segment_id] = "HELD"
+    return m
