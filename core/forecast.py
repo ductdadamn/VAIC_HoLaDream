@@ -56,20 +56,22 @@ def _all_od_pairs():
     return [(a, b) for a, b in itertools.combinations(ORDERED_STATION_NAMES, 2)]
 
 
-def _top_driver(external: dict) -> str | None:
+def _top_driver(external: dict) -> str:
+    """Luôn trả về string hiển thị được — explain.py ghép thẳng vào câu "Why", None
+    sẽ in ra "...— None." trên UI. Không có cờ đặc biệt -> nhu cầu nền theo mùa/tuần."""
     if not external:
-        return None
+        return "nhu cầu nền theo lịch sử"
     if external.get("is_tet"):
         return "Tết Nguyên Đán"
     if external.get("is_holiday"):
-        return "Ngày nghỉ lễ"
+        return "ngày nghỉ lễ"
     if external.get("event_flag"):
-        return "Sự kiện địa phương"
+        return "sự kiện địa phương"
     if external.get("flight_price_index", 100) >= 120:
-        return "Giá vé máy bay tăng cao"
+        return "giá vé máy bay tăng cao"
     if external.get("weather") == "bão":
-        return "Thời tiết xấu (giảm cầu)"
-    return None
+        return "thời tiết xấu (giảm cầu)"
+    return "nhu cầu nền theo mùa/ngày trong tuần (không có yếu tố bất thường)"
 
 
 def forecast_demand(hist_df: pd.DataFrame, depart_date, external: dict | None = None) -> pd.DataFrame:

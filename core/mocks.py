@@ -1,6 +1,8 @@
 """core/mocks.py — dữ liệu giả để walking skeleton chạy trước khi Dev 1 nối forecast thật.
 Contract KHÔNG đổi: mock_forecast trả đúng schema của forecast_demand.
 """
+import zlib
+
 import numpy as np
 import pandas as pd
 
@@ -24,11 +26,19 @@ _TOP_DRIVER_TEXT = {
 }
 
 
+def stable_seed(*parts) -> int:
+    """Hash ổn định qua các lần chạy process khác nhau (zlib.crc32 trên chuỗi
+    UTF-8) — builtin hash() KHÔNG dùng được vì Python salt ngẫu nhiên hash(str)
+    mỗi lần khởi động process, seed sẽ đổi dù cùng input."""
+    data = "|".join(str(p) for p in parts).encode("utf-8")
+    return zlib.crc32(data)
+
+
 def mock_forecast(depart_date) -> pd.DataFrame:
     """→ DataFrame [origin, destination, expected_pax, confidence, top_driver].
     Seed theo depart_date để số liệu ổn định giữa các lần chạy demo cùng ngày.
     """
-    seed = abs(hash((str(depart_date), "railmind-mock"))) % (2**32)
+    seed = stable_seed(depart_date, "railmind-mock")
     rng = np.random.default_rng(seed)
     rows = []
     for origin, destination, base_pax, driver_key in _MOCK_ROUTES:
