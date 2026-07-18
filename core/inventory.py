@@ -135,11 +135,13 @@ def route_fare(from_station: str, to_station: str) -> float:
 def find_gaps(seat_matrix: pd.DataFrame) -> pd.DataFrame:
     """→ [seat_id, gap_from, gap_to, matched_demand, extra_revenue].
     Quét từng hàng (ghế) tìm đoạn EMPTY liên tục kẹp giữa 2 đoạn SOLD.
-    matched_demand = số ghế KHÁC đã bán trọn đúng đúng đoạn gap này — tín hiệu cầu
-    quan sát trực tiếp từ ma trận (find_gaps chỉ nhận seat_matrix theo contract,
-    không có forecast_df để join; generate_policies sẽ làm giàu thêm bằng forecast
-    khi lắp gap_fills vào Policy).
-    extra_revenue ước lượng bằng khoảng cách (km_from_hanoi) × giá/km cố định.
+    matched_demand = số ghế KHÁC đã bán trọn đúng đoạn gap này — tín hiệu cầu quan
+    sát trực tiếp từ ma trận (find_gaps chỉ nhận seat_matrix theo contract, không
+    có forecast_df để join; generate_policies sẽ làm giàu thêm bằng forecast khi
+    lắp gap_fills vào Policy).
+    extra_revenue = giá vé nếu lấp được ĐÚNG 1 gap này (route_fare gap_from→gap_to).
+    KHÔNG nhân với matched_demand — mỗi gap chỉ là 1 ghế, chỉ bán được 1 lần;
+    matched_demand chỉ là tín hiệu cầu, không phải số vé bán được từ gap này.
     """
     columns = list(seat_matrix.columns)
     segments = [tuple(col.split(SEG_SEP)) for col in columns]
@@ -158,7 +160,7 @@ def find_gaps(seat_matrix: pd.DataFrame) -> pd.DataFrame:
                     gap_to = segments[j - 1][1]
                     gap_cols = columns[i:j]
                     matched_demand = int((seat_matrix[gap_cols] == "SOLD").all(axis=1).sum())
-                    extra_revenue = round(matched_demand * route_fare(gap_from, gap_to), 0)
+                    extra_revenue = round(route_fare(gap_from, gap_to), 0)
                     rows.append({
                         "seat_id": seat_id,
                         "gap_from": gap_from,
