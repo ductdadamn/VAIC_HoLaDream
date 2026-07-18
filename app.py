@@ -156,7 +156,7 @@ if "depart_date" not in st.session_state:
 h1, h2 = st.columns([3, 1])
 with h1:
     st.markdown("## 🚆 Vietnam Railway United — Decision Copilot")
-    st.caption("Đang đăng nhập: **Chị Hạnh – Trưởng phòng RM**")
+    st.caption("Đang đăng nhập: **Chị Bảy – Trưởng phòng RM**")
 with h2:
     st.markdown(
         "<div style='text-align:right;padding-top:18px;color:gray;font-size:.85rem'>"
