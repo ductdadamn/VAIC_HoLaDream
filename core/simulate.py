@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from core.inventory import SEG_SEP, distance_km, route_fare, segments_between
+from core.mocks import stable_seed
 from core.policy import score_gaps
 
 _NOISE_PCT = 0.15  # Monte Carlo: nhiễu ±15% vào p_long mỗi run (blueprint mục 12)
@@ -90,7 +91,11 @@ def simulate(policy: dict, forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame,
     hold_set = set(policy["hold_seats"])
     held_gaps = scored_gaps[scored_gaps["seat_id"].isin(hold_set)] if not scored_gaps.empty else scored_gaps
 
-    rng = np.random.default_rng()
+    # Seed ổn định theo (seat_matrix của đúng train+date, tên policy) — Streamlit
+    # rerun lại toàn bộ script mỗi lần user click nút; không seed sẽ làm
+    # revenue/confidence/risk của CÙNG policy nhảy số mỗi lần rerun trên demo.
+    seed = stable_seed(tuple(seat_matrix.index), tuple(seat_matrix.columns), policy["name"])
+    rng = np.random.default_rng(seed)
     revenue_samples = []
     hold_wins = 0
 
