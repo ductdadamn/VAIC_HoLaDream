@@ -123,13 +123,18 @@ def segments_between(from_station: str, to_station: str) -> list:
     return [f"{f}{SEG_SEP}{t}" for f, t in segments if order[f] >= lo and order[t] <= hi]
 
 
+def distance_km(from_station: str, to_station: str) -> float:
+    """Khoảng cách giữa 2 ga theo km_from_hanoi — dùng chung cho fare và pax_km."""
+    stations = _load_stations()
+    km = dict(zip(stations["name"], stations["km_from_hanoi"]))
+    return abs(km[to_station] - km[from_station])
+
+
 def route_fare(from_station: str, to_station: str) -> float:
     """Ước lượng fare theo khoảng cách km_from_hanoi × giá/km cố định — dùng chung
     cho find_gaps/policy/simulate vì các hàm đó không nhận giá vé thật theo contract.
     """
-    stations = _load_stations()
-    km = dict(zip(stations["name"], stations["km_from_hanoi"]))
-    return abs(km[to_station] - km[from_station]) * _PRICE_PER_KM
+    return distance_km(from_station, to_station) * _PRICE_PER_KM
 
 
 def find_gaps(seat_matrix: pd.DataFrame) -> pd.DataFrame:

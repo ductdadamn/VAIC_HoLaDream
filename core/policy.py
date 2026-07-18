@@ -8,6 +8,7 @@ from core.inventory import find_gaps, route_fare, segment_occupancy, segments_be
 
 _BOTTLENECK_WEIGHT = 0.5
 _FALLBACK_CONFIDENCE = 0.3  # route không có trong forecast -> giả định cầu dài thấp
+_GAP_FILL_COLUMNS = ["seat_id", "gap_from", "gap_to", "matched_demand", "extra_revenue"]
 
 _POLICY_PRESETS = [
     {
@@ -54,9 +55,10 @@ def _p_long_haul(forecast_df: pd.DataFrame, origin: str, destination: str) -> fl
 
 
 def _score_gap(gap_row, forecast_df: pd.DataFrame, occupancy: dict) -> pd.Series:
-    """Sell_score = giá vé chặng ngắn (1 hop đầu của gap).
+    """Sell_score = giá vé chặng ngắn (hop đầu của gap, chắc chắn thu được).
     Hold_score = P(khách dài, từ forecast) × giá vé chặng dài + bottleneck_penalty.
-    bottleneck_penalty tỉ lệ occupancy của chặng nghẽn nhất mà gap này đi qua.
+    bottleneck_penalty tỉ lệ occupancy của chặng nghẽn nhất mà gap này đi qua
+    (occupancy càng cao, bán ngắn qua đó càng chặn mất vé dài giá cao).
     """
     gap_cols = segments_between(gap_row["gap_from"], gap_row["gap_to"])
     bottleneck_occupancy = max((occupancy.get(col, 0.0) for col in gap_cols), default=0.0)
@@ -68,34 +70,46 @@ def _score_gap(gap_row, forecast_df: pd.DataFrame, occupancy: dict) -> pd.Series
     p_long = _p_long_haul(forecast_df, gap_row["gap_from"], gap_row["gap_to"])
     bottleneck_penalty = bottleneck_occupancy * long_fare * _BOTTLENECK_WEIGHT
     hold_score = p_long * long_fare + bottleneck_penalty
-    return pd.Series({"sell_score": short_fare, "hold_score": hold_score, "bottleneck_penalty": bottleneck_penalty})
+    return pd.Series({
+        "sell_score": short_fare,
+        "hold_score": hold_score,
+        "bottleneck_penalty": bottleneck_penalty,
+        "p_long": p_long,
+        "long_fare": long_fare,
+        "short_fare": short_fare,
+        "short_to": first_to,
+    })
+
+
+def score_gaps(forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame) -> pd.DataFrame:
+    """→ find_gaps() làm giàu thêm sell_score/hold_score/bottleneck_penalty/p_long/
+    long_fare/short_fare/short_to. Public để simulate.py dùng lại CHÍNH cách tính
+    này cho Monte Carlo (nhiễu p_long) thay vì tính lại từ đầu.
+    """
+    gaps = find_gaps(seat_matrix)
+    extra_cols = ["sell_score", "hold_score", "bottleneck_penalty", "p_long", "long_fare", "short_fare", "short_to"]
+    if gaps.empty:
+        return gaps.reindex(columns=[*gaps.columns, *extra_cols])
+    occupancy = segment_occupancy(seat_matrix)
+    scores = gaps.apply(lambda row: _score_gap(row, forecast_df, occupancy), axis=1)
+    return pd.concat([gaps, scores], axis=1)
 
 
 def generate_policies(forecast_df: pd.DataFrame, seat_matrix: pd.DataFrame) -> list:
     """→ list[Policy]. Policy = {name, safety_margin, hold_seats, price_multiplier,
     open_quota_at, gap_fills, last_call_hours, fit_context}.
     """
-    gaps = find_gaps(seat_matrix)
-    occupancy = segment_occupancy(seat_matrix)
-
-    scored_gaps = gaps.copy()
-    if not scored_gaps.empty:
-        scores = scored_gaps.apply(lambda row: _score_gap(row, forecast_df, occupancy), axis=1)
-        scored_gaps = pd.concat([scored_gaps, scores], axis=1)
+    scored_gaps = score_gaps(forecast_df, seat_matrix)
 
     policies = []
     for preset in _POLICY_PRESETS:
         margin = preset["safety_margin"]
         if scored_gaps.empty:
-            hold_seats, gap_fills = [], scored_gaps
+            hold_seats, gap_fills = [], scored_gaps.reindex(columns=_GAP_FILL_COLUMNS)
         else:
             hold_mask = scored_gaps["hold_score"] > scored_gaps["sell_score"] * (1 + margin)
             hold_seats = scored_gaps.loc[hold_mask, "seat_id"].tolist()
-            gap_fills = (
-                scored_gaps.loc[~hold_mask]
-                .drop(columns=["sell_score", "hold_score", "bottleneck_penalty"])
-                .reset_index(drop=True)
-            )
+            gap_fills = scored_gaps.loc[~hold_mask, _GAP_FILL_COLUMNS].reset_index(drop=True)
 
         policies.append({
             "name": preset["name"],
