@@ -22,6 +22,7 @@ EXTERNAL_CSV = "data/external_signals.csv"
 ORDERED_STATION_NAMES = [STATION_NAME[sid] for sid in ORDERED_STATION_IDS]
 
 _HIST_COLUMNS = ["status", "date", "origin_station", "destination_station", "days_before_departure"]
+_FALLBACK_REQUIRED_COLUMNS = ["status", "date", "origin_station", "destination_station"]
 _GENERIC_DRIVER = "nhu cầu nền theo mùa/ngày trong tuần (không có yếu tố bất thường)"
 
 
@@ -63,9 +64,14 @@ def _all_od_pairs():
 
 def _external_flag_driver(external: dict) -> str | None:
     """Cờ external nổi bật nhất theo thứ tự ưu tiên (Tết > lễ > sự kiện > vé bay
-    cao > bão > học sinh nghỉ) -> None nếu không có cờ nào bật, để nhường chỗ
-    cho driver theo booking pace (forecast_demand) hoặc câu chung chung
-    (forecast_fallback, qua _top_driver)."""
+    cao > bão) -> None nếu không có cờ nào bật, để nhường chỗ cho driver theo
+    booking pace (forecast_demand) hoặc câu chung chung (forecast_fallback, qua
+    _top_driver).
+    school_in_session CỐ Ý KHÔNG nằm ở đây (chỉ ảnh hưởng _season_multiplier):
+    ~31.6% số ngày trong data có school_in_session=False (gồm cả ngày showcase
+    mặc định SE3/2026-07-25) — nếu xếp ưu tiên cao hơn pace_driver, top_driver
+    của MỌI route trong bảng sẽ quay về cùng 1 câu, mất hết phân biệt theo từng
+    route mà booking-curve (_forecast_booking_curve) mang lại."""
     if not external:
         return None
     if external.get("is_tet"):
@@ -78,8 +84,6 @@ def _external_flag_driver(external: dict) -> str | None:
         return "giá vé máy bay tăng cao"
     if external.get("weather") == "bão":
         return "thời tiết xấu (giảm cầu)"
-    if external.get("school_in_session") is False:
-        return "học sinh nghỉ (nhu cầu du lịch gia đình tăng)"
     return None
 
 
@@ -109,18 +113,47 @@ def _season_multiplier(external: dict) -> float:
     return mult
 
 
+def _safe_default_forecast(external: dict) -> pd.DataFrame:
+    """Bảng mặc định an toàn tuyệt đối — KHÔNG đụng hist_df, chỉ dùng khi
+    forecast_fallback vẫn lỗi dù đã validate đủ cột (vd date không parse được).
+    Đây là lưới an toàn của lưới an toàn — luôn phải trả được, không bao giờ raise."""
+    driver = _top_driver(external)
+    season_mult = _season_multiplier(external)
+    expected_pax = round(1.5 * season_mult, 1)
+    rows = [
+        {"origin": o, "destination": d, "expected_pax": expected_pax, "confidence": 0.35, "top_driver": driver}
+        for o, d in _all_od_pairs()
+    ]
+    return pd.DataFrame(rows)
+
+
 def forecast_fallback(hist_df: pd.DataFrame, depart_date, external: dict | None = None) -> pd.DataFrame:
     """→ [origin, destination, expected_pax, confidence, top_driver]
     Seasonal + Moving Average + Holiday flag — lưới an toàn cuối, KHÔNG BAO GIỜ
     raise. forecast_demand() rơi về đây khi booking-curve model lỗi hoặc thiếu
-    dữ liệu, để hệ không bao giờ đứng hình giữa demo."""
+    dữ liệu, để hệ không bao giờ đứng hình giữa demo.
+
+    hist_df có thể có days_before_departure (đủ để forecast_demand không rẽ vào
+    đây từ đầu) nhưng THIẾU cột khác (status/origin_station/destination_station)
+    — validate đủ _FALLBACK_REQUIRED_COLUMNS trước, coi như rỗng nếu thiếu, rồi
+    còn bọc thêm try/except quanh phần xử lý chính để tuyệt đối không tự sập.
+    """
     external = external or {}
     depart_date = to_date_str(depart_date)
-    dow = pd.Timestamp(depart_date).dayofweek
 
-    if hist_df is None or not len(hist_df):
+    if hist_df is None or not len(hist_df) or not set(_FALLBACK_REQUIRED_COLUMNS).issubset(hist_df.columns):
         hist_df = pd.DataFrame(columns=_HIST_COLUMNS)
 
+    try:
+        return _forecast_fallback_impl(hist_df, depart_date, external)
+    except Exception:
+        return _safe_default_forecast(external)
+
+
+def _forecast_fallback_impl(hist_df: pd.DataFrame, depart_date: str, external: dict) -> pd.DataFrame:
+    """Thân xử lý thật của forecast_fallback — giả định hist_df đã qua validate cột
+    ở forecast_fallback(). Tách riêng để try/except ở đó bọc trọn cả khối này."""
+    dow = pd.Timestamp(depart_date).dayofweek
     booked = hist_df[hist_df["status"] == "booked"].copy() if len(hist_df) else hist_df
     same_dow = booked.iloc[0:0]
     if len(booked):
@@ -179,15 +212,20 @@ def _forecast_booking_curve(booked: pd.DataFrame, same_dow: pd.DataFrame, extern
     days_before_departure (tốc độ đặt vé, trước đó không dùng tới) để:
     (a) OD có booking pace càng đều (cv thấp) -> confidence càng cao;
     (b) khi KHÔNG có cờ external nổi bật, top_driver mô tả đúng hành vi đặt vé
-    của từng OD (đặt sớm / đặt sát ngày) thay vì 1 câu chung chung cho cả bảng."""
-    global_dbd = _od_dbd_series(booked)
-    global_mean = float(global_dbd.mean()) if len(global_dbd) else 16.0
-    global_std = float(global_dbd.std()) if len(global_dbd) > 1 else 12.0
+    của từng OD (đặt sớm / đặt sát ngày) thay vì 1 câu chung chung cho cả bảng.
 
+    z-score của pace_driver so route_mean với ĐỘ LỆCH CHUẨN GIỮA CÁC ROUTE (between-
+    route std), KHÔNG phải độ lệch chuẩn từng vé gộp chung (within-route, luôn rất
+    lớn vì mỗi route có hàng trăm vé lẻ) — dùng within-route std làm mẫu số sẽ
+    không bao giờ vượt ngưỡng 0.5 dù route thực sự khác biệt (verify trên data
+    thật: within-route std ~16.7 ngày -> |z| tối đa 0.17 cho MỌI route; dùng đúng
+    between-route std ~1.2 ngày -> |z| tối đa ~2.1, vượt ngưỡng rõ ràng)."""
     flag_driver = _external_flag_driver(external)
     season_mult = _season_multiplier(external)
 
-    rows = []
+    # Pass 1: gom thống kê từng route (base_pax/cv/od_mean) — cần trước để tính
+    # between-route mean/std làm mẫu số z-score ở Pass 2.
+    per_route = []
     for origin, destination in _all_od_pairs():
         od_all = booked[(booked.origin_station == origin) & (booked.destination_station == destination)]
         n_dates_all = od_all["date"].nunique()
@@ -211,15 +249,31 @@ def _forecast_booking_curve(booked: pd.DataFrame, same_dow: pd.DataFrame, extern
             cv = 0.8
 
         od_dbd = _od_dbd_series(source)
+        od_mean = float(od_dbd.mean()) if len(od_dbd) >= 3 else None
+        od_std = float(od_dbd.std()) if len(od_dbd) >= 3 else None
+        per_route.append({
+            "origin": origin, "destination": destination,
+            "base_pax": base_pax, "sample_n": sample_n, "cv": cv,
+            "od_mean": od_mean, "od_std": od_std,
+        })
+
+    route_means = [r["od_mean"] for r in per_route if r["od_mean"] is not None]
+    between_mean = float(np.mean(route_means)) if route_means else 16.0
+    between_std = float(np.std(route_means, ddof=1)) if len(route_means) > 1 else 0.0
+
+    rows = []
+    for r in per_route:
+        origin, destination = r["origin"], r["destination"]
+        base_pax, sample_n, cv = r["base_pax"], r["sample_n"], r["cv"]
+
         pace_bonus = 0.0
         pace_driver = None
-        if len(od_dbd) >= 3:
-            od_mean = float(od_dbd.mean())
-            od_std = float(od_dbd.std())
+        if r["od_mean"] is not None:
+            od_mean, od_std = r["od_mean"], r["od_std"]
             dbd_cv = od_std / max(od_mean, 1e-6)
             pace_bonus = 0.05 * (1 - min(dbd_cv, 1.0))
-            if global_std > 0:
-                z = (od_mean - global_mean) / global_std
+            if between_std > 0:
+                z = (od_mean - between_mean) / between_std
                 if z >= 0.5:
                     pace_driver = f"khách đặt vé sớm cho chặng này (trung bình trước {od_mean:.0f} ngày)"
                 elif z <= -0.5:
