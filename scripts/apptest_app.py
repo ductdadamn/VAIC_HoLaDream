@@ -6,6 +6,17 @@ at.run()
 print("1) initial run exceptions:", list(at.exception))
 print("   session train/date:", at.session_state["train"], at.session_state["depart_date"])
 
+# click 1 nut trong Exception Alert Feed sang tau KHAC tau dang chon - tung crash
+# vi st.session_state["train"] bi gan lai sau khi widget key="train" da khoi tao
+initial_train = at.session_state["train"]
+other_alert_buttons = [b for b in at.button if b.key.startswith("alert_") and b.key != f"alert_{initial_train}"]
+assert other_alert_buttons, "khong tim thay nut alert_ khac tau dang chon"
+other_alert_buttons[0].click().run()
+print("1b) after click nut Exception Alert Feed (doi tau), exceptions:", list(at.exception))
+print("   session train:", at.session_state["train"], "(truoc do:", initial_train, ")")
+assert not list(at.exception), "click nut Exception Alert Feed bi crash"
+assert at.session_state["train"] != initial_train, "click nut Exception Alert Feed khong doi duoc tau"
+
 # tìm nút Approve và click
 approve_buttons = [b for b in at.button if b.key == "approve_btn"]
 assert approve_buttons, "khong tim thay nut Approve"

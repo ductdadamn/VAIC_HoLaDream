@@ -137,6 +137,13 @@ st.session_state.setdefault("audit_log", [])
 st.session_state.setdefault("selected_policy", "Balanced")
 st.session_state.setdefault("last_toast", None)
 
+# Áp key tạm TRƯỚC khi widget key="train" khởi tạo (dòng ~164) — Streamlit cấm
+# gán st.session_state["train"] sau khi widget cùng key đó đã khởi tạo trong
+# cùng 1 lượt chạy script (StreamlitAPIException). Exception Alert Feed ghi vào
+# "pending_train" rồi rerun, áp dụng ở đây trước khi selectbox dựng lên.
+if "pending_train" in st.session_state:
+    st.session_state["train"] = st.session_state.pop("pending_train")
+
 # tìm ngày "sự cố" mạnh nhất của từng tàu để làm mặc định ngày khởi hành
 status_by_train = {tr: train_status_table(tickets, tr) for tr in TRAINS}
 if "depart_date" not in st.session_state:
@@ -197,7 +204,7 @@ with left:
         label = f"{'🔴' if is_alert else '🟢'} {tr} — {bott} {fmt_pct(occ,0)}" + (" — SỰ CỐ QUỸ GHẾ" if is_alert else "")
         st.markdown(f'<div class="{css_class}">', unsafe_allow_html=True)
         if st.button(label, key=f"alert_{tr}", width="stretch"):
-            st.session_state["train"] = tr
+            st.session_state["pending_train"] = tr
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
