@@ -137,6 +137,16 @@ st.session_state.setdefault("audit_log", [])
 st.session_state.setdefault("selected_policy", "Balanced")
 st.session_state.setdefault("last_toast", None)
 
+# Exception Alert Feed đổi tàu qua nút bấm (không phải qua chính selectbox key=
+# "train"). KHÔNG được gán thẳng st.session_state["train"] = ... trong thân nút
+# bấm — widget key="train" đã instantiate lúc đó trong CÙNG lượt chạy rồi, gán
+# thẳng sẽ ném StreamlitAPIException, script chết giữa chừng (mọi thứ dưới nó —
+# Approve/Override/Audit Log — không kịp render lượt đó, UI đứng lại nhìn như
+# "treo"). Nút chỉ được ghi vào biến staging "_pending_train" rồi rerun(); áp
+# staging vào "train" ở ĐÂY — TRƯỚC khi selectbox key="train" được tạo bên dưới.
+if "_pending_train" in st.session_state:
+    st.session_state["train"] = st.session_state.pop("_pending_train")
+
 # tìm ngày "sự cố" mạnh nhất của từng tàu để làm mặc định ngày khởi hành
 status_by_train = {tr: train_status_table(tickets, tr) for tr in TRAINS}
 if "depart_date" not in st.session_state:
@@ -171,6 +181,16 @@ with hc3:
 train = st.session_state["train"]
 depart_date = st.session_state["depart_date"]
 
+# show_override_dialog KHÔNG phải widget key (không bị giới hạn thứ tự gán như
+# "train" ở trên) nên reset thoải mái ở đây. Đóng sạch dialog Override mỗi khi
+# tàu/ngày đổi — nếu không, quyết định dở dang (đang chọn lý do, chưa xác nhận)
+# của CHUYẾN CŨ sẽ rò sang chuyến mới: dialog tự mở lại với tiêu đề mới nhưng
+# lý do cũ vẫn còn chọn sẵn trong selectbox.
+current_context = (train, depart_date)
+if st.session_state.get("_dialog_context") != current_context:
+    st.session_state["show_override_dialog"] = False
+    st.session_state["_dialog_context"] = current_context
+
 st.divider()
 
 ext, seg_df, matrix, gaps, fc, policies, baseline, sims, ranking = run_pipeline(tickets, train, depart_date)
@@ -197,7 +217,7 @@ with left:
         label = f"{'🔴' if is_alert else '🟢'} {tr} — {bott} {fmt_pct(occ,0)}" + (" — SỰ CỐ QUỸ GHẾ" if is_alert else "")
         st.markdown(f'<div class="{css_class}">', unsafe_allow_html=True)
         if st.button(label, key=f"alert_{tr}", width="stretch"):
-            st.session_state["train"] = tr
+            st.session_state["_pending_train"] = tr
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -368,9 +388,13 @@ with btn_col2:
 @st.dialog("Lý do Override")
 def override_dialog():
     st.write(f"Override chính sách **{POLICY_LABEL_VI[selected_name]}** cho **{train} · {depart_date}**.")
+    # key scope theo (train, depart_date, selected_name): đổi context là widget
+    # MỚI hoàn toàn với state trắng — không cần (và không được phép) tự gán lại
+    # session_state["override_reason"] để "reset" nó, vì selectbox này đã
+    # instantiate ngay dòng trên trong CÙNG lượt chạy rồi.
     reason = st.selectbox(
         "Lý do (bắt buộc chọn)", OVERRIDE_REASONS, index=None,
-        placeholder="-- Chọn lý do --", key="override_reason",
+        placeholder="-- Chọn lý do --", key=f"override_reason_{train}_{depart_date}_{selected_name}",
     )
     c1, c2 = st.columns(2)
     with c1:
