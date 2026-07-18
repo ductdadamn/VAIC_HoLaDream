@@ -186,9 +186,17 @@ depart_date = st.session_state["depart_date"]
 # tàu/ngày đổi — nếu không, quyết định dở dang (đang chọn lý do, chưa xác nhận)
 # của CHUYẾN CŨ sẽ rò sang chuyến mới: dialog tự mở lại với tiêu đề mới nhưng
 # lý do cũ vẫn còn chọn sẵn trong selectbox.
+#
+# override_reason: dùng key CỐ ĐỊNH (không đổi theo context — key đổi liên tục
+# không giải quyết được gì thêm ở đây và tự tạo rủi ro khác trong AppTest, xem
+# scripts/apptest_app.py). "Reset" giá trị đúng pattern đã dùng cho "train": xoá
+# staging TRƯỚC khi override_dialog() (và selectbox bên trong nó) có thể được
+# gọi ở dưới trong CÙNG lượt này — an toàn vì tại điểm này selectbox chưa
+# instantiate lượt này, bất kể đã instantiate ở lượt trước hay chưa.
 current_context = (train, depart_date)
 if st.session_state.get("_dialog_context") != current_context:
     st.session_state["show_override_dialog"] = False
+    st.session_state.pop("override_reason", None)
     st.session_state["_dialog_context"] = current_context
 
 st.divider()
@@ -388,13 +396,11 @@ with btn_col2:
 @st.dialog("Lý do Override")
 def override_dialog():
     st.write(f"Override chính sách **{POLICY_LABEL_VI[selected_name]}** cho **{train} · {depart_date}**.")
-    # key scope theo (train, depart_date, selected_name): đổi context là widget
-    # MỚI hoàn toàn với state trắng — không cần (và không được phép) tự gán lại
-    # session_state["override_reason"] để "reset" nó, vì selectbox này đã
-    # instantiate ngay dòng trên trong CÙNG lượt chạy rồi.
+    # key CỐ ĐỊNH — reset (nếu cần) đã xảy ra ở khối context-change phía trên,
+    # TRƯỚC dòng này, nên không cần và không được tự gán lại state ở đây.
     reason = st.selectbox(
         "Lý do (bắt buộc chọn)", OVERRIDE_REASONS, index=None,
-        placeholder="-- Chọn lý do --", key=f"override_reason_{train}_{depart_date}_{selected_name}",
+        placeholder="-- Chọn lý do --", key="override_reason",
     )
     c1, c2 = st.columns(2)
     with c1:

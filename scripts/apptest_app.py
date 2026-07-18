@@ -4,8 +4,7 @@ from streamlit.testing.v1 import AppTest
 
 
 def _reason_selectbox(at):
-    """key giờ scope theo (train, depart_date, selected_name) nên đổi động —
-    tìm theo label ổn định thay vì key cứng."""
+    """key cố định "override_reason" — tìm theo label cho gọn (không phụ thuộc key)."""
     boxes = [s for s in at.selectbox if s.label == "Lý do (bắt buộc chọn)"]
     return boxes[0] if boxes else None
 
@@ -124,3 +123,61 @@ print(f"2.4) mo dialog + chon ly do + doi tau (chua bam Xac nhan): dialog TU DON
       f"audit_log van = {n_final} ban ghi (dung, khong tu ghi)")
 
 print("\n=== TAI HIEN BUG PO: TAT CA ASSERT PASS ===")
+
+
+# ============================================================ 3) SAU KHI DUNG OVERRIDE, TUONG TAC TIEP CO AN TOAN? ============================================================
+# Kich ban tech lead them: Approve/Override -> chon ly do -> Xac nhan (dialog dong
+# dung) -> RERUN TIEP THEO BAT KY (du khong bam gi) -> KeyError o 1 widget key da
+# khong con duoc render.
+#
+# Da dieu tra rieng, KHONG chi tin theo mo ta:
+#   - streamlit/streamlit issue #9128 (status:confirmed, P3, con OPEN o ban
+#     1.59.2 - ban moi nhat hien co): AppTest.run() thu thap lai widget_states
+#     cho MOI node tung thay trong cay object noi bo cua AppTest, ke ca node
+#     cua 1 widget da bien mat (khong con duoc goi) o lan chay truoc. session_
+#     state that da prune key do, AppTest thi chua -> KeyError. Issue noi RO:
+#     "doesn't affect real deployed apps in browsers" - chi AppTest gap.
+#   - Tu viet 1 file rieng, KHONG dung st.dialog, KHONG dung code cua app nay:
+#     if state['show']: st.selectbox(key='picker'); if button: state['show']=False
+#     -> cung crash y het khi rerun tiep theo. Vay loi KHONG rieng cho st.dialog
+#     hay cho app nay.
+#   - Doi selectbox "Ly do" sang key CO DINH (thay vi key dong truoc do) tren
+#     CHINH app.py that -> VAN crash y het. Vay khong phai do key dong.
+#   - Them 1 widget "trailing" sau dialog (mot huong workaround tinh co thay
+#     tac dung tren repro toi gian) -> KHONG tac dung tren app that (van crash).
+#   => Ket luan: day la gioi han CUA CONG CU TEST (AppTest), khong sua duoc
+#      o code app.py theo cach thong thuong, va KHONG anh huong nguoi dung
+#      that tren Streamlit Cloud (theo chinh mo ta cua issue).
+#
+# Cach verify KHONG dinh vao gioi han nay: dung AppTest MOI, seed thang
+# session_state ve dung trang thai "vua Override xong" (audit_log da co 1 ban
+# ghi, dialog da dong) - widget "override_reason" CHUA TUNG duoc render trong
+# instance nay nen khong co node mo coi trong cay -> khong dinh bug #9128 -
+# roi thuc hien 1 tuong tac that (bam nut khac) de xac nhan APP (khong phai
+# AppTest) hoat dong dung.
+at3 = AppTest.from_file("app.py", default_timeout=60)
+at3.run()
+seed_train = at3.session_state["train"]
+seed_date = at3.session_state["depart_date"]
+at3.session_state["audit_log"] = [{
+    "timestamp": "2026-07-18 20:00:00", "train": seed_train, "date": seed_date,
+    "policy": "Quyết liệt", "action": "OVERRIDE", "reason": "Nghi ngờ đầu cơ",
+}]
+at3.session_state["show_override_dialog"] = False
+at3.run()
+assert not list(at3.exception), f"loi ngay khi seed trang thai 'vua Override xong': {list(at3.exception)}"
+n_seeded = len(at3.session_state["audit_log"])
+assert n_seeded == 1, f"seed audit_log that bai: {n_seeded}"
+
+# tuong tac that tiep theo: Approve cho chinh sach dang chon
+approve3 = [b for b in at3.button if b.key == "approve_btn"][0]
+approve3.click().run()
+assert not list(at3.exception), f"CRASH khi Approve NGAY SAU trang thai da tung Override: {list(at3.exception)}"
+n_after = len(at3.session_state["audit_log"])
+assert n_after == n_seeded + 1, (
+    f"Approve sau khi da tung Override ghi sai so luong: {n_seeded} -> {n_after}, ky vong +1"
+)
+print(f"3) Approve NGAY SAU trang thai 'vua Override xong' (seed, khong di qua widget dialog "
+      f"da bien mat): OK, audit_log {n_seeded} -> {n_after}")
+
+print("\n=== PHAN 3 (VERIFY LOGIC UNG DUNG, KHONG DINH GIOI HAN APPTEST #9128): PASS ===")
